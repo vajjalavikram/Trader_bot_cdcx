@@ -5,6 +5,10 @@ All authenticated requests follow the pattern:
   1. Build a JSON body with a top-level ``timestamp``.
   2. HMAC-SHA256 sign the compact JSON string.
   3. POST with ``X-AUTH-APIKEY`` and ``X-AUTH-SIGNATURE`` headers.
+
+Every public function accepts an optional ``cfg`` (StrategyConfig) so that
+multiple strategies can call the exchange simultaneously with independent
+credentials and parameters.
 """
 
 import hashlib
@@ -16,8 +20,8 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from bot import config
 from bot.config import normalize_pair
+from bot.strategy_config import StrategyConfig, resolve_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -55,29 +59,31 @@ class CoinDCXAPIError(Exception):
 # Low-level transport
 # ---------------------------------------------------------------------------
 
-def _signed_request(method: str, endpoint: str, body: Dict[str, Any]) -> Any:
-    """Sign *body*, send *method* request to *endpoint*, return parsed JSON.
+def _signed_request(
+    method: str,
+    endpoint: str,
+    body: Dict[str, Any],
+    cfg: Optional[StrategyConfig] = None,
+) -> Any:
+    """Sign *body*, send *method* request to *endpoint*, return parsed JSON."""
+    cfg = resolve_cfg(cfg)
 
-    - Logs the outgoing payload and inbound response at INFO level.
-    - 4xx errors are raised immediately (bad request — retrying won't help).
-    - 5xx / network errors are retried up to ``API_MAX_RETRIES`` times.
-    """
     json_body = json.dumps(body, separators=(",", ":"))
-    url = f"{config.BASE_URL}{endpoint}"
+    url = f"{cfg.base_url}{endpoint}"
 
     logger.info("CoinDCX request  → %s %s", method, endpoint)
     logger.info("CoinDCX payload  : %s", json_body)
 
-    secret_bytes = bytes(config.API_SECRET, encoding="utf-8")
+    secret_bytes = bytes(cfg.api_secret, encoding="utf-8")
     signature = hmac.new(secret_bytes, json_body.encode(), hashlib.sha256).hexdigest()
 
     headers = {
         "Content-Type": "application/json",
-        "X-AUTH-APIKEY": config.API_KEY,
+        "X-AUTH-APIKEY": cfg.api_key,
         "X-AUTH-SIGNATURE": signature,
     }
 
-    for attempt in range(1, config.API_MAX_RETRIES + 1):
+    for attempt in range(1, cfg.api_max_retries + 1):
         try:
             resp = requests.request(
                 method, url, data=json_body, headers=headers, timeout=15,
@@ -108,9 +114,9 @@ def _signed_request(method: str, endpoint: str, body: Dict[str, Any]) -> Any:
                     endpoint, resp.status_code, resp.text, resp_json, json_body,
                 )
 
-            if attempt < config.API_MAX_RETRIES:
-                logger.warning("Retrying in %.1fs…", config.API_RETRY_DELAY_SECONDS)
-                time.sleep(config.API_RETRY_DELAY_SECONDS)
+            if attempt < cfg.api_max_retries:
+                logger.warning("Retrying in %.1fs…", cfg.api_retry_delay_seconds)
+                time.sleep(cfg.api_retry_delay_seconds)
                 continue
 
             raise CoinDCXAPIError(
@@ -123,37 +129,46 @@ def _signed_request(method: str, endpoint: str, body: Dict[str, Any]) -> Any:
         except requests.RequestException as exc:
             logger.warning(
                 "Network error on %s (attempt %d/%d): %s",
-                endpoint, attempt, config.API_MAX_RETRIES, exc,
+                endpoint, attempt, cfg.api_max_retries, exc,
             )
-            if attempt < config.API_MAX_RETRIES:
-                time.sleep(config.API_RETRY_DELAY_SECONDS)
+            if attempt < cfg.api_max_retries:
+                time.sleep(cfg.api_retry_delay_seconds)
             else:
                 raise
 
 
-def _sign_and_post(endpoint: str, body: Dict[str, Any]) -> Any:
-    return _signed_request("POST", endpoint, body)
+def _sign_and_post(
+    endpoint: str, body: Dict[str, Any], cfg: Optional[StrategyConfig] = None,
+) -> Any:
+    return _signed_request("POST", endpoint, body, cfg=cfg)
 
 
-def _sign_and_get(endpoint: str, body: Dict[str, Any]) -> Any:
-    return _signed_request("GET", endpoint, body)
+def _sign_and_get(
+    endpoint: str, body: Dict[str, Any], cfg: Optional[StrategyConfig] = None,
+) -> Any:
+    return _signed_request("GET", endpoint, body, cfg=cfg)
 
 
 # ---------------------------------------------------------------------------
 # Leverage
 # ---------------------------------------------------------------------------
 
-def update_leverage(leverage: int) -> None:
+def update_leverage(
+    leverage: int,
+    cfg: Optional[StrategyConfig] = None,
+) -> None:
     """Set leverage for the configured pair before placing an order."""
+    cfg = resolve_cfg(cfg)
     body: Dict[str, Any] = {
         "timestamp": _ts(),
         "leverage": str(leverage),
-        "pair": normalize_pair(config.PAIR),
+        "pair": normalize_pair(cfg.pair),
     }
-    if config.MARGIN_CURRENCY != "USDT":
-        body["margin_currency_short_name"] = config.MARGIN_CURRENCY
+    if cfg.margin_currency != "USDT":
+        body["margin_currency_short_name"] = cfg.margin_currency
     result = _sign_and_post(
         "/exchange/v1/derivatives/futures/positions/update_leverage", body,
+        cfg=cfg,
     )
     logger.info("Leverage updated to %dx: %s", leverage, result)
 
@@ -168,26 +183,15 @@ def place_order(
     quantity: float,
     order_type: str = "market",
     leverage: int = 10,
+    cfg: Optional[StrategyConfig] = None,
 ) -> Dict[str, Any]:
     """
     Place a CoinDCX Futures order (without TP/SL).
 
-    TP/SL must be created separately via :func:`create_tpsl` after the
-    position is opened — the order-creation endpoint does not support them.
-
     Returns a dict that **always** contains a ``success`` boolean.
-
-    On success::
-
-        {"success": True, "order_id": "…", "entry_price": …,
-         "quantity": …, "status": "…", "_raw": {…}}
-
-    On API error::
-
-        {"success": False, "status_code": 400, "error": {…},
-         "payload": {…}, "message": "…"}
     """
-    api_pair = normalize_pair(config.PAIR)
+    cfg = resolve_cfg(cfg)
+    api_pair = normalize_pair(cfg.pair)
     api_order_type = "market_order" if order_type == "market" else "limit_order"
 
     order: Dict[str, Any] = {
@@ -196,7 +200,7 @@ def place_order(
         "order_type": api_order_type,
         "total_quantity": quantity,
         "leverage": leverage,
-        "margin_currency_short_name": config.MARGIN_CURRENCY,
+        "margin_currency_short_name": cfg.margin_currency,
         "notification": "no_notification",
         "hidden": False,
         "post_only": False,
@@ -213,10 +217,9 @@ def place_order(
 
     logger.info("CoinDCX Order Payload:\n%s", json.dumps(body, indent=2))
 
-    # --- Send request (CoinDCXAPIError is caught here, not propagated) ----
     try:
         raw = _sign_and_post(
-            "/exchange/v1/derivatives/futures/orders/create", body,
+            "/exchange/v1/derivatives/futures/orders/create", body, cfg=cfg,
         )
     except CoinDCXAPIError as exc:
         logger.error(
@@ -231,7 +234,6 @@ def place_order(
             "message": str(exc),
         }
 
-    # --- Parse successful response (list of orders) -----------------------
     if isinstance(raw, list):
         order_data = raw[0] if raw else {}
     else:
@@ -259,10 +261,7 @@ def place_order(
 def _extract_entry_price(
     order_data: Dict[str, Any], fallback: float,
 ) -> float:
-    """Pick the best available price from the order response.
-
-    Preference: avg_price (filled) → price (limit) → fallback.
-    """
+    """Pick the best available price from the order response."""
     avg = order_data.get("avg_price")
     if avg is not None:
         try:
@@ -288,25 +287,36 @@ def _extract_entry_price(
 # Positions
 # ---------------------------------------------------------------------------
 
-def get_position(pair: Optional[str] = None) -> Any:
+def get_position(
+    pair: Optional[str] = None,
+    cfg: Optional[StrategyConfig] = None,
+) -> Any:
     """Fetch the current position for the configured pair."""
+    cfg = resolve_cfg(cfg)
     body = {
         "timestamp": _ts(),
         "page": "1",
         "size": "10",
-        "pairs": pair or normalize_pair(config.PAIR),
-        "margin_currency_short_name": [config.MARGIN_CURRENCY],
+        "pairs": pair or normalize_pair(cfg.pair),
+        "margin_currency_short_name": [cfg.margin_currency],
     }
-    return _sign_and_post("/exchange/v1/derivatives/futures/positions", body)
+    return _sign_and_post(
+        "/exchange/v1/derivatives/futures/positions", body, cfg=cfg,
+    )
 
 
-def exit_position(position_id: str) -> Dict[str, Any]:
+def exit_position(
+    position_id: str,
+    cfg: Optional[StrategyConfig] = None,
+) -> Dict[str, Any]:
     """Close an entire position by its ID (market exit)."""
     body = {
         "timestamp": _ts(),
         "id": position_id,
     }
-    result = _sign_and_post("/exchange/v1/derivatives/futures/positions/exit", body)
+    result = _sign_and_post(
+        "/exchange/v1/derivatives/futures/positions/exit", body, cfg=cfg,
+    )
     logger.info("Position exit requested: %s", result)
     return result
 
@@ -315,12 +325,9 @@ def create_tpsl(
     position_id: str,
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
+    cfg: Optional[StrategyConfig] = None,
 ) -> Dict[str, Any]:
-    """Attach take-profit and/or stop-loss to an open position.
-
-    Returns a dict with ``success`` boolean so the caller can display
-    exchange errors in the UI without crashing.
-    """
+    """Attach take-profit and/or stop-loss to an open position."""
     logger.info("Creating TP/SL for position: %s", position_id)
     if tp_price is not None:
         logger.info("  TP price: %.4f", tp_price)
@@ -345,6 +352,7 @@ def create_tpsl(
     try:
         result = _sign_and_post(
             "/exchange/v1/derivatives/futures/positions/create_tpsl", body,
+            cfg=cfg,
         )
         logger.info("TP/SL set successfully on position %s: %s", position_id, result)
         return {"success": True, "_raw": result}
@@ -365,20 +373,21 @@ def create_tpsl(
 # Wallet balance
 # ---------------------------------------------------------------------------
 
-def get_futures_wallets() -> list:
+def get_futures_wallets(cfg: Optional[StrategyConfig] = None) -> list:
     """Fetch all futures wallets (INR and USDT) from CoinDCX."""
     body = {"timestamp": _ts()}
-    return _sign_and_get("/exchange/v1/derivatives/futures/wallets", body)
+    return _sign_and_get(
+        "/exchange/v1/derivatives/futures/wallets", body, cfg=cfg,
+    )
 
 
-def get_wallet_balance(currency: str = "INR") -> Optional[float]:
-    """Return available margin for a specific futures wallet currency.
-
-    Available = balance − locked_balance − cross_order_margin − cross_user_margin.
-    Returns ``None`` when the wallet for *currency* is not found.
-    """
+def get_wallet_balance(
+    currency: str = "INR",
+    cfg: Optional[StrategyConfig] = None,
+) -> Optional[float]:
+    """Return available margin for a specific futures wallet currency."""
     try:
-        wallets = get_futures_wallets()
+        wallets = get_futures_wallets(cfg=cfg)
     except Exception as exc:
         logger.warning("Could not fetch futures wallets: %s", exc)
         return None

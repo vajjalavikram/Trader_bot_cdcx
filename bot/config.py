@@ -1,10 +1,25 @@
+"""
+config.py
+
+Central configuration for the trading bot.  All strategy parameters,
+API credentials, and runtime tunables are defined here as module-level
+variables that can be overridden at startup via environment variables,
+a JSON file (``runtime_config.json``), or the Streamlit UI (which calls
+``load_from_dict``).
+
+Key relationships
+-----------------
+* ``NOTIONAL`` is the primary position-size input (total position value).
+* ``MARGIN`` is derived: ``NOTIONAL / LEVERAGE``.
+* ``PAIR`` is always normalised to CoinDCX's ``B-BASE_QUOTE`` format.
+"""
+
 import json as _json
-import os
 import logging
+import os
 
 # ---------------------------------------------------------------------------
 # CoinDCX API credentials
-# Set these via environment variables or a .env file before running the bot.
 # ---------------------------------------------------------------------------
 API_KEY: str = os.getenv("COINDCX_API_KEY", "")
 API_SECRET: str = os.getenv("COINDCX_API_SECRET", "")
@@ -36,6 +51,9 @@ MARGIN_CURRENCY = os.getenv("MARGIN_CURRENCY", "INR")
 
 TRADING_MODE = os.getenv("TRADING_MODE", "simulation").lower()
 SIM_BALANCE = float(os.getenv("SIM_BALANCE", "10000"))
+
+# Portfolio-level risk guardrail (multi-strategy mode)
+MAX_PORTFOLIO_MARGIN = float(os.getenv("MAX_PORTFOLIO_MARGIN", "50000"))
 
 # ---------------------------------------------------------------------------
 # Retry / resilience
@@ -110,6 +128,7 @@ _KEY_MAP = {
     "margin_currency": "MARGIN_CURRENCY",
     "trading_mode": "TRADING_MODE",
     "sim_balance": "SIM_BALANCE",
+    "max_portfolio_margin": "MAX_PORTFOLIO_MARGIN",
 }
 
 _TYPE_COERCIONS = {
@@ -123,6 +142,7 @@ _TYPE_COERCIONS = {
     "TAKE_PROFIT_PERCENT": float,
     "STOP_LOSS_PERCENT": float,
     "SIM_BALANCE": float,
+    "MAX_PORTFOLIO_MARGIN": float,
 }
 
 

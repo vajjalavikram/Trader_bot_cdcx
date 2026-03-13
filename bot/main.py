@@ -6,11 +6,14 @@ Flow
 1. Validate configuration.
 2. Set leverage for the pair.
 3. Seed the price cache.
-4. Loop every ``CHECK_FREQUENCY_SECONDS``:
+4. Loop every ``check_frequency_seconds``:
    a. Fetch current price and price from X minutes ago.
    b. Evaluate the strategy (momentum / reversal).
    c. If triggered → place order → begin position monitoring.
-   d. If ``STRATEGY_EXPIRY_MINUTES`` elapses without a trigger → exit.
+   d. If expiry elapses without a trigger → exit.
+
+The ``run()`` function accepts a ``StrategyConfig`` so that multiple
+strategies can execute in parallel without sharing global state.
 """
 
 import logging
@@ -19,16 +22,19 @@ import time
 import threading
 from typing import Callable, Optional
 
-from bot import config
 from bot.exchange_precision import snap_price
-from bot.execution import get_position, get_wallet_balance, place_order, update_leverage, create_tpsl
+from bot.execution import (
+    get_position, get_wallet_balance, place_order,
+    update_leverage, create_tpsl,
+)
 from bot.market_data import (
     fetch_current_price, fetch_instrument_rules, fetch_price_x_minutes_ago,
     fetch_usdt_inr_rate, seed_cache, clear_cache, snap_quantity,
 )
-from bot.position_monitor import compute_tp_sl, monitor
+from bot.position_monitor import check_tp_sl_hit, compute_tp_sl, monitor
 from bot.sim_wallet import SimWallet, compute_unrealized_pnl
 from bot.strategy import evaluate
+from bot.strategy_config import StrategyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,39 +43,30 @@ class BotError(Exception):
     """Raised for fatal bot errors instead of calling sys.exit."""
 
 
-def _validate_config() -> None:
+def _validate_config(cfg: StrategyConfig) -> None:
     errors = []
-    if config.TRADING_MODE == "live":
-        if not config.API_KEY:
+    if cfg.trading_mode == "live":
+        if not cfg.api_key:
             errors.append("COINDCX_API_KEY is not set")
-        if not config.API_SECRET:
+        if not cfg.api_secret:
             errors.append("COINDCX_API_SECRET is not set")
-    if config.DIRECTION not in ("LONG", "SHORT"):
-        errors.append(f"DIRECTION must be LONG or SHORT, got {config.DIRECTION}")
-    if config.STRATEGY_MODE not in ("momentum", "reversal"):
-        errors.append(f"STRATEGY_MODE must be momentum or reversal, got {config.STRATEGY_MODE}")
-    if config.ORDER_TYPE not in ("market", "limit"):
-        errors.append(f"ORDER_TYPE must be market or limit, got {config.ORDER_TYPE}")
+    if cfg.direction not in ("LONG", "SHORT"):
+        errors.append(f"DIRECTION must be LONG or SHORT, got {cfg.direction}")
+    if cfg.strategy_mode not in ("momentum", "reversal"):
+        errors.append(f"STRATEGY_MODE must be momentum or reversal, got {cfg.strategy_mode}")
+    if cfg.order_type not in ("market", "limit"):
+        errors.append(f"ORDER_TYPE must be market or limit, got {cfg.order_type}")
     if errors:
         for e in errors:
             logger.error("Config error: %s", e)
         raise BotError("; ".join(errors))
 
 
-def _compute_quantity(current_price: float, rules: dict) -> float:
-    """Derive order quantity from notional value and current price.
-
-    ``config.NOTIONAL`` is the total position value in the user's margin
-    currency.  When the margin currency is INR it is first converted to
-    USDT so the quantity is calculated correctly against the USDT-quoted
-    price feed.
-
-    The raw quantity is then snapped to the exchange's step-size and
-    clamped to min/max limits from *rules*.
-    """
-    notional = config.NOTIONAL
-    if config.MARGIN_CURRENCY == "INR":
-        usdt_inr = fetch_usdt_inr_rate()
+def _compute_quantity(current_price: float, rules: dict, cfg: StrategyConfig) -> float:
+    """Derive order quantity from notional value and current price."""
+    notional = cfg.notional
+    if cfg.margin_currency == "INR":
+        usdt_inr = fetch_usdt_inr_rate(cfg=cfg)
         notional_usdt = notional / usdt_inr
         logger.info(
             "INR → USDT notional: ₹%.2f / %.2f = $%.4f",
@@ -116,20 +113,17 @@ _POSITION_POLL_RETRIES = 10
 _POSITION_POLL_DELAY = 0.5  # seconds  (total wait ≈ 5 s)
 
 
-def _resolve_position_id(stop_event: Optional[threading.Event] = None) -> str:
-    """Poll for the position until it appears (up to ~5 seconds).
-
-    After a market order fills, CoinDCX may take a brief moment before the
-    position shows up in the positions endpoint.  This function retries up
-    to ``_POSITION_POLL_RETRIES`` times with a ``_POSITION_POLL_DELAY``
-    pause between attempts.
-    """
+def _resolve_position_id(
+    cfg: StrategyConfig,
+    stop_event: Optional[threading.Event] = None,
+) -> str:
+    """Poll for the position until it appears (up to ~5 seconds)."""
     for attempt in range(1, _POSITION_POLL_RETRIES + 1):
         try:
-            positions = get_position()
+            positions = get_position(cfg=cfg)
             if isinstance(positions, list):
                 for pos in positions:
-                    if pos.get("pair") == config.PAIR:
+                    if pos.get("pair") == cfg.pair:
                         logger.info(
                             "Position found on attempt %d/%d — id=%s",
                             attempt, _POSITION_POLL_RETRIES, pos["id"],
@@ -144,7 +138,7 @@ def _resolve_position_id(stop_event: Optional[threading.Event] = None) -> str:
         if attempt < _POSITION_POLL_RETRIES:
             logger.info(
                 "Position for %s not yet available — retrying in %.1fs (attempt %d/%d)",
-                config.PAIR, _POSITION_POLL_DELAY, attempt, _POSITION_POLL_RETRIES,
+                cfg.pair, _POSITION_POLL_DELAY, attempt, _POSITION_POLL_RETRIES,
             )
             if stop_event:
                 stop_event.wait(timeout=_POSITION_POLL_DELAY)
@@ -156,7 +150,7 @@ def _resolve_position_id(stop_event: Optional[threading.Event] = None) -> str:
     raise BotError(
         f"Position not found after order execution — "
         f"polled {_POSITION_POLL_RETRIES} times over "
-        f"{_POSITION_POLL_RETRIES * _POSITION_POLL_DELAY:.1f}s for {config.PAIR}. "
+        f"{_POSITION_POLL_RETRIES * _POSITION_POLL_DELAY:.1f}s for {cfg.pair}. "
         f"TP/SL creation skipped."
     )
 
@@ -164,6 +158,7 @@ def _resolve_position_id(stop_event: Optional[threading.Event] = None) -> str:
 def _sim_monitor(
     sim_wallet: SimWallet,
     sim_position: dict,
+    cfg: StrategyConfig,
     instrument_rules: Optional[dict] = None,
     stop_event: Optional[threading.Event] = None,
     status_callback: Optional[Callable] = None,
@@ -182,9 +177,13 @@ def _sim_monitor(
         return False
 
     entry_price = sim_position["entry_price"]
-    direction = config.DIRECTION
+    direction = cfg.direction
     price_inc = instrument_rules.get("price_increment", 0) if instrument_rules else 0
-    tp_price, sl_price = compute_tp_sl(entry_price, direction, price_inc)
+    tp_price, sl_price = compute_tp_sl(
+        entry_price, direction, price_inc,
+        tp_percent=cfg.take_profit_percent,
+        sl_percent=cfg.stop_loss_percent,
+    )
     position_id = sim_position["id"]
     quantity = sim_position["quantity"]
     margin = sim_position["margin"]
@@ -195,25 +194,25 @@ def _sim_monitor(
     )
 
     while True:
-        if _sleep(config.CHECK_FREQUENCY_SECONDS):
+        if _sleep(cfg.check_frequency_seconds):
             logger.info("Stop signal received during sim monitoring")
             return "stopped"
 
         try:
-            current_price = fetch_current_price()
+            current_price = fetch_current_price(cfg=cfg)
         except Exception as exc:
             logger.error("Price fetch failed during sim monitoring: %s", exc)
             continue
 
         rate = 1.0
-        if config.MARGIN_CURRENCY == "INR":
+        if cfg.margin_currency == "INR":
             try:
-                rate = fetch_usdt_inr_rate()
+                rate = fetch_usdt_inr_rate(cfg=cfg)
             except Exception:
                 pass
 
         pnl = compute_unrealized_pnl(
-            sim_position, current_price, config.MARGIN_CURRENCY, rate,
+            sim_position, current_price, cfg.margin_currency, rate,
         )
 
         _status(
@@ -243,23 +242,13 @@ def _sim_monitor(
             current_price, pnl["pnl_local"], pnl["pnl_percent"],
         )
 
-        hit: Optional[str] = None
-        if direction == "LONG":
-            if current_price >= tp_price:
-                hit = "tp"
-            elif current_price <= sl_price:
-                hit = "sl"
-        else:
-            if current_price <= tp_price:
-                hit = "tp"
-            elif current_price >= sl_price:
-                hit = "sl"
+        hit = check_tp_sl_hit(current_price, tp_price, sl_price, direction)
 
         if hit:
             logger.info("SIM: %s hit at %.4f", hit.upper(), current_price)
             try:
                 sim_wallet.close_position(
-                    position_id, current_price, config.MARGIN_CURRENCY, rate,
+                    position_id, current_price, cfg.margin_currency, rate,
                 )
             except Exception as exc:
                 logger.error("SIM: Failed to close position: %s", exc)
@@ -274,6 +263,7 @@ def _sim_monitor(
 
 
 def run(
+    strategy_config: Optional[StrategyConfig] = None,
     stop_event: Optional[threading.Event] = None,
     status_callback: Optional[Callable] = None,
     sim_wallet: Optional[SimWallet] = None,
@@ -283,20 +273,23 @@ def run(
 
     Parameters
     ----------
+    strategy_config : StrategyConfig, optional
+        Per-strategy configuration.  When ``None`` (CLI mode) a config
+        is built from global ``bot.config`` values.
     stop_event : threading.Event, optional
         When set externally the bot exits gracefully at the next check.
     status_callback : callable, optional
         Called with keyword arguments to push live telemetry to the UI.
-        Accepted keys: current_price, past_price, price_change,
-        entry_triggered, entry_side, position_status, phase, error.
+    sim_wallet : SimWallet, optional
+        Simulated wallet for paper-trading mode.
     """
+    cfg = strategy_config or StrategyConfig.from_global_config()
 
     def _status(**kw):
         if status_callback:
             status_callback(**kw)
 
     def _sleep(seconds: float):
-        """Interruptible sleep — returns True if stop was requested."""
         if stop_event:
             stop_event.wait(timeout=seconds)
             return stop_event.is_set()
@@ -310,31 +303,31 @@ def run(
     logger.info("=" * 60)
     logger.info("CoinDCX Futures Dip/Rise Bot starting")
     logger.info("=" * 60)
-    logger.info("Pair            : %s", config.PAIR)
-    logger.info("Direction       : %s", config.DIRECTION)
-    logger.info("Strategy mode   : %s", config.STRATEGY_MODE)
-    logger.info("Dip/Rise %%      : %.2f%%", config.DIP_PERCENT)
-    logger.info("Window          : %d min", config.COMPARISON_WINDOW_MINUTES)
-    logger.info("Check frequency : %d sec", config.CHECK_FREQUENCY_SECONDS)
-    logger.info("Expiry          : %d min", config.STRATEGY_EXPIRY_MINUTES)
-    logger.info("Notional        : %.2f %s", config.NOTIONAL, config.MARGIN_CURRENCY)
-    logger.info("Margin (derived): %.2f %s", config.MARGIN, config.MARGIN_CURRENCY)
-    logger.info("Leverage        : %dx", config.LEVERAGE)
-    logger.info("Order type      : %s", config.ORDER_TYPE)
-    logger.info("TP              : %.2f%%", config.TAKE_PROFIT_PERCENT)
-    logger.info("SL              : %.2f%%", config.STOP_LOSS_PERCENT)
-    logger.info("Trading mode    : %s", config.TRADING_MODE)
+    logger.info("Pair            : %s", cfg.pair)
+    logger.info("Direction       : %s", cfg.direction)
+    logger.info("Strategy mode   : %s", cfg.strategy_mode)
+    logger.info("Dip/Rise %%      : %.2f%%", cfg.dip_percent)
+    logger.info("Window          : %d min", cfg.comparison_window_minutes)
+    logger.info("Check frequency : %d sec", cfg.check_frequency_seconds)
+    logger.info("Expiry          : %d min", cfg.strategy_expiry_minutes)
+    logger.info("Notional        : %.2f %s", cfg.notional, cfg.margin_currency)
+    logger.info("Margin (derived): %.2f %s", cfg.margin, cfg.margin_currency)
+    logger.info("Leverage        : %dx", cfg.leverage)
+    logger.info("Order type      : %s", cfg.order_type)
+    logger.info("TP              : %.2f%%", cfg.take_profit_percent)
+    logger.info("SL              : %.2f%%", cfg.stop_loss_percent)
+    logger.info("Trading mode    : %s", cfg.trading_mode)
     logger.info("=" * 60)
 
-    _validate_config()
+    _validate_config(cfg)
     _status(phase="Starting")
 
-    is_sim = config.TRADING_MODE == "simulation"
+    is_sim = cfg.trading_mode == "simulation"
 
     # --- Step 1: Set leverage ------------------------------------------------
     if not is_sim:
         try:
-            update_leverage(config.LEVERAGE)
+            update_leverage(cfg.leverage, cfg=cfg)
         except Exception as exc:
             logger.error("Failed to set leverage: %s", exc)
             raise BotError(f"Leverage update failed: {exc}") from exc
@@ -343,7 +336,7 @@ def run(
 
     # --- Step 1b: Fetch instrument rules ------------------------------------
     try:
-        rules = fetch_instrument_rules(config.PAIR, config.MARGIN_CURRENCY)
+        rules = fetch_instrument_rules(cfg.pair, cfg.margin_currency, cfg=cfg)
         _status(instrument_rules=rules)
         logger.info(
             "Instrument constraints: min_qty=%.8f  step=%.8f  min_notional=%.2f",
@@ -355,20 +348,20 @@ def run(
 
     # --- Step 1c: Fetch USDT/INR rate if needed -----------------------------
     usdt_inr_rate: float = 0.0
-    if config.MARGIN_CURRENCY == "INR":
+    if cfg.margin_currency == "INR":
         try:
-            usdt_inr_rate = fetch_usdt_inr_rate()
+            usdt_inr_rate = fetch_usdt_inr_rate(cfg=cfg)
             _status(usdt_inr_rate=usdt_inr_rate)
         except Exception as exc:
             logger.warning("Could not fetch USDT/INR rate: %s", exc)
 
     # --- Step 2: Clear stale data & seed cache -------------------------------
     clear_cache()
-    seed_cache()
+    seed_cache(cfg=cfg)
 
     # --- Step 3: Entry scanning loop -----------------------------------------
     start_time = time.time()
-    expiry_seconds = config.STRATEGY_EXPIRY_MINUTES * 60
+    expiry_seconds = cfg.strategy_expiry_minutes * 60
     _status(phase="Scanning")
 
     while True:
@@ -381,7 +374,7 @@ def run(
         if elapsed >= expiry_seconds:
             logger.info(
                 "Strategy expiry reached (%d min). No entry triggered — shutting down.",
-                config.STRATEGY_EXPIRY_MINUTES,
+                cfg.strategy_expiry_minutes,
             )
             _status(phase="Expired", position_status="No entry — expired")
             return
@@ -390,12 +383,12 @@ def run(
         logger.info("Scanning for entry… (expiry in ~%d min)", remaining)
 
         try:
-            current_price = fetch_current_price()
-            past_price = fetch_price_x_minutes_ago(config.COMPARISON_WINDOW_MINUTES)
+            current_price = fetch_current_price(cfg=cfg)
+            past_price = fetch_price_x_minutes_ago(cfg.comparison_window_minutes, cfg=cfg)
         except Exception as exc:
             logger.error("Market data error: %s — retrying next cycle", exc)
             _status(current_price=None, price_change=None)
-            if _sleep(config.CHECK_FREQUENCY_SECONDS):
+            if _sleep(cfg.check_frequency_seconds):
                 _status(phase="Stopped")
                 return
             continue
@@ -403,17 +396,16 @@ def run(
         if past_price is None:
             logger.warning("Could not retrieve past price — skipping cycle")
             _status(current_price=current_price, past_price=None, price_change=None)
-            if _sleep(config.CHECK_FREQUENCY_SECONDS):
+            if _sleep(cfg.check_frequency_seconds):
                 _status(phase="Stopped")
                 return
             continue
 
         price_change = (current_price - past_price) / past_price * 100
 
-        # Refresh USDT/INR rate for display
-        if config.MARGIN_CURRENCY == "INR":
+        if cfg.margin_currency == "INR":
             try:
-                usdt_inr_rate = fetch_usdt_inr_rate()
+                usdt_inr_rate = fetch_usdt_inr_rate(cfg=cfg)
             except Exception:
                 pass
 
@@ -433,7 +425,7 @@ def run(
         else:
             logger.info("Price: $%.4f", current_price)
 
-        side = evaluate(current_price, past_price)
+        side = evaluate(current_price, past_price, cfg=cfg)
 
         if side is not None:
             # --- Entry triggered ------------------------------------------
@@ -446,35 +438,35 @@ def run(
 
                 sim_bal = sim_wallet.get_balance()
                 _status(wallet_balance=sim_bal)
-                logger.info("Sim Wallet Balance: %.2f %s", sim_bal, config.MARGIN_CURRENCY)
+                logger.info("Sim Wallet Balance: %.2f %s", sim_bal, cfg.margin_currency)
 
-                margin_req = config.MARGIN
+                margin_req = cfg.margin
                 if margin_req > sim_bal:
                     msg = (
-                        f"Insufficient sim {config.MARGIN_CURRENCY} margin — "
+                        f"Insufficient sim {cfg.margin_currency} margin — "
                         f"need {margin_req:.2f}, available {sim_bal:.2f}"
                     )
                     logger.error(msg)
                     _status(phase="Error", error=msg)
                     return
 
-                qty = _compute_quantity(current_price, rules)
+                qty = _compute_quantity(current_price, rules, cfg)
 
                 logger.info("--- Simulated Order ---")
-                logger.info("  Side          : %s (%s)", side, config.DIRECTION)
-                logger.info("  Notional      : %.2f %s", config.NOTIONAL, config.MARGIN_CURRENCY)
-                logger.info("  Margin Req    : %.2f %s", margin_req, config.MARGIN_CURRENCY)
+                logger.info("  Side          : %s (%s)", side, cfg.direction)
+                logger.info("  Notional      : %.2f %s", cfg.notional, cfg.margin_currency)
+                logger.info("  Margin Req    : %.2f %s", margin_req, cfg.margin_currency)
                 logger.info("  Quantity      : %.8f", qty)
                 logger.info("  Price         : %.4f", current_price)
 
                 try:
-                    sim_pos =                     sim_wallet.open_position(
-                        pair=config.PAIR,
+                    sim_pos = sim_wallet.open_position(
+                        pair=cfg.pair,
                         side=side,
                         entry_price=current_price,
                         quantity=qty,
                         margin=margin_req,
-                        leverage=config.LEVERAGE,
+                        leverage=cfg.leverage,
                     )
                 except ValueError as exc:
                     logger.error("Simulated order failed: %s", exc)
@@ -488,21 +480,23 @@ def run(
 
                 entry_price = current_price
                 tp_price, sl_price = compute_tp_sl(
-                    entry_price, config.DIRECTION, rules["price_increment"],
+                    entry_price, cfg.direction, rules["price_increment"],
+                    tp_percent=cfg.take_profit_percent,
+                    sl_percent=cfg.stop_loss_percent,
                 )
-                _validate_tp_sl(entry_price, tp_price, sl_price, config.DIRECTION)
+                _validate_tp_sl(entry_price, tp_price, sl_price, cfg.direction)
 
                 _status(
                     phase="Positioned",
                     position_status=(
-                        f"SIM {config.DIRECTION} @ {entry_price:.4f}  "
+                        f"SIM {cfg.direction} @ {entry_price:.4f}  "
                         f"TP={tp_price:.4f}  SL={sl_price:.4f}"
                     ),
                     wallet_balance=sim_wallet.get_balance(),
                 )
 
                 result = _sim_monitor(
-                    sim_wallet, sim_pos,
+                    sim_wallet, sim_pos, cfg,
                     instrument_rules=rules,
                     stop_event=stop_event,
                     status_callback=status_callback,
@@ -524,15 +518,14 @@ def run(
                 return
 
             # ---- Live trading path ----------------------------------------
-            # Fetch wallet balance and validate margin requirement
-            wallet_bal = get_wallet_balance(config.MARGIN_CURRENCY)
+            wallet_bal = get_wallet_balance(cfg.margin_currency, cfg=cfg)
             _status(wallet_balance=wallet_bal)
-            margin_req = config.MARGIN  # = NOTIONAL / LEVERAGE
+            margin_req = cfg.margin
             if wallet_bal is not None:
-                logger.info("Wallet Balance  : %.2f %s", wallet_bal, config.MARGIN_CURRENCY)
+                logger.info("Wallet Balance  : %.2f %s", wallet_bal, cfg.margin_currency)
                 if margin_req > wallet_bal:
                     msg = (
-                        f"Insufficient {config.MARGIN_CURRENCY} margin — "
+                        f"Insufficient {cfg.margin_currency} margin — "
                         f"need {margin_req:.2f}, available {wallet_bal:.2f}"
                     )
                     logger.error(msg)
@@ -541,41 +534,39 @@ def run(
             else:
                 logger.warning(
                     "Could not fetch %s wallet balance — proceeding without validation",
-                    config.MARGIN_CURRENCY,
+                    cfg.margin_currency,
                 )
 
-            qty = _compute_quantity(current_price, rules)
+            qty = _compute_quantity(current_price, rules, cfg)
 
-            # Snap limit-order price to exchange tick
             order_price = current_price
-            if config.ORDER_TYPE == "limit":
+            if cfg.order_type == "limit":
                 raw_p = current_price
                 order_price = snap_price(current_price, rules["price_increment"])
                 if order_price != raw_p:
                     logger.info("Limit price snapped: %.8f → %.8f", raw_p, order_price)
 
             logger.info("--- Pre-Order Debug ---")
-            logger.info("Margin Currency : %s", config.MARGIN_CURRENCY)
+            logger.info("Margin Currency : %s", cfg.margin_currency)
             logger.info("Wallet Balance  : %s", f"{wallet_bal:.2f}" if wallet_bal is not None else "N/A")
-            logger.info("Notional        : %.2f %s", config.NOTIONAL, config.MARGIN_CURRENCY)
-            logger.info("Margin Required : %.2f %s", margin_req, config.MARGIN_CURRENCY)
+            logger.info("Notional        : %.2f %s", cfg.notional, cfg.margin_currency)
+            logger.info("Margin Required : %.2f %s", margin_req, cfg.margin_currency)
             logger.info("Quantity        : %.8f", qty)
             logger.info("Min Quantity    : %.8f", rules["min_quantity"])
             logger.info("Qty Increment   : %.8f", rules["quantity_increment"])
             logger.info(
                 "Placing %s %s order — qty=%.6f price=%.4f",
-                config.ORDER_TYPE, side, qty, order_price,
+                cfg.order_type, side, qty, order_price,
             )
 
-            # --- Place the order (no TP/SL — CoinDCX doesn't support them
-            #     in the order-creation endpoint) -----------------------------
             try:
                 order_result = place_order(
                     side=side,
                     current_price=order_price,
                     quantity=qty,
-                    order_type=config.ORDER_TYPE,
-                    leverage=config.LEVERAGE,
+                    order_type=cfg.order_type,
+                    leverage=cfg.leverage,
+                    cfg=cfg,
                 )
             except Exception as exc:
                 logger.error("Order placement failed (network/unexpected): %s", exc)
@@ -597,11 +588,11 @@ def run(
                         "message": order_result.get("message"),
                         "entry_params": {
                             "side": side,
-                            "direction": config.DIRECTION,
-                            "order_type": config.ORDER_TYPE,
+                            "direction": cfg.direction,
+                            "order_type": cfg.order_type,
                             "current_price": current_price,
                             "quantity": qty,
-                            "leverage": config.LEVERAGE,
+                            "leverage": cfg.leverage,
                         },
                     },
                 )
@@ -614,20 +605,20 @@ def run(
                 entry_price, order_result["quantity"],
             )
 
-            # --- Compute TP/SL from the actual entry price (snapped) ----------
             tp_price, sl_price = compute_tp_sl(
-                entry_price, config.DIRECTION, rules["price_increment"],
+                entry_price, cfg.direction, rules["price_increment"],
+                tp_percent=cfg.take_profit_percent,
+                sl_percent=cfg.stop_loss_percent,
             )
-            _validate_tp_sl(entry_price, tp_price, sl_price, config.DIRECTION)
+            _validate_tp_sl(entry_price, tp_price, sl_price, cfg.direction)
 
             _status(
                 phase="Positioned",
-                position_status=f"{config.DIRECTION} @ {entry_price:.4f}  TP={tp_price:.4f}  SL={sl_price:.4f}",
+                position_status=f"{cfg.direction} @ {entry_price:.4f}  TP={tp_price:.4f}  SL={sl_price:.4f}",
             )
 
-            # --- Resolve position ID (with retry for delayed availability) ----
             try:
-                position_id = _resolve_position_id(stop_event=stop_event)
+                position_id = _resolve_position_id(cfg, stop_event=stop_event)
             except BotError as exc:
                 logger.error("Could not resolve position ID: %s", exc)
                 _status(
@@ -635,9 +626,9 @@ def run(
                     error_detail={
                         "message": str(exc),
                         "entry_params": {
-                            "pair": config.PAIR,
+                            "pair": cfg.pair,
                             "entry_price": entry_price,
-                            "direction": config.DIRECTION,
+                            "direction": cfg.direction,
                             "tp_price": tp_price,
                             "sl_price": sl_price,
                         },
@@ -646,10 +637,10 @@ def run(
                 logger.warning("Falling back to client-side monitoring without server TP/SL")
                 position_id = None
 
-            # --- Create TP/SL on the open position ---------------------------
             if position_id is not None:
-                tpsl_result = create_tpsl(position_id, tp_price=tp_price, sl_price=sl_price)
-
+                tpsl_result = create_tpsl(
+                    position_id, tp_price=tp_price, sl_price=sl_price, cfg=cfg,
+                )
                 if not tpsl_result.get("success"):
                     sc = tpsl_result.get("status_code", "?")
                     logger.error(
@@ -668,7 +659,7 @@ def run(
                                 "entry_price": entry_price,
                                 "tp_price": tp_price,
                                 "sl_price": sl_price,
-                                "direction": config.DIRECTION,
+                                "direction": cfg.direction,
                             },
                         },
                     )
@@ -676,13 +667,12 @@ def run(
                         "Continuing to client-side monitoring despite TP/SL creation failure"
                     )
 
-            # --- Step 4: Position monitoring ------------------------------
             result = monitor(
                 entry_price,
                 position_id,
+                cfg=cfg,
                 quantity=order_result["quantity"],
                 margin=margin_req,
-                margin_currency=config.MARGIN_CURRENCY,
                 usdt_inr_rate=usdt_inr_rate,
                 stop_event=stop_event,
                 status_callback=status_callback,
@@ -698,7 +688,7 @@ def run(
             )
             return
 
-        if _sleep(config.CHECK_FREQUENCY_SECONDS):
+        if _sleep(cfg.check_frequency_seconds):
             _status(phase="Stopped")
             return
 

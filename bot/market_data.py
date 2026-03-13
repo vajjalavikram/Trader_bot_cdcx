@@ -4,17 +4,19 @@ Fetch market prices from CoinDCX public endpoints.
 Uses the candlestick API (1-minute resolution) to build a lightweight
 in-memory price cache so we can compare current price to the price
 X minutes ago without redundant API calls.
+
+All functions accept an optional ``cfg`` (StrategyConfig) for per-strategy
+isolation.  When omitted, global ``bot.config`` values are used as fallback.
 """
 
 import logging
-import math
 import time
 from collections import deque
 from typing import Any, Dict, Optional
 
 import requests
 
-from bot import config
+from bot.strategy_config import StrategyConfig, resolve_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -26,28 +28,38 @@ _usdt_inr_cache: Dict[str, Any] = {"rate": None, "ts": 0.0}
 _instrument_cache: Dict[str, dict] = {}
 
 
-def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
-    for attempt in range(1, config.API_MAX_RETRIES + 1):
+def _request_with_retry(
+    method: str,
+    url: str,
+    cfg: Optional[StrategyConfig] = None,
+    **kwargs,
+) -> requests.Response:
+    cfg = resolve_cfg(cfg)
+    for attempt in range(1, cfg.api_max_retries + 1):
         try:
             resp = requests.request(method, url, timeout=10, **kwargs)
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
-            logger.warning("API request failed (attempt %d/%d): %s", attempt, config.API_MAX_RETRIES, exc)
-            if attempt < config.API_MAX_RETRIES:
-                time.sleep(config.API_RETRY_DELAY_SECONDS)
+            logger.warning(
+                "API request failed (attempt %d/%d): %s",
+                attempt, cfg.api_max_retries, exc,
+            )
+            if attempt < cfg.api_max_retries:
+                time.sleep(cfg.api_retry_delay_seconds)
             else:
                 raise
 
 
-def fetch_current_price(pair: Optional[str] = None) -> float:
-    """Return the latest traded price via the trades endpoint.
-
-    If *pair* is ``None`` the configured ``config.PAIR`` is used.
-    """
-    p = pair or config.PAIR
-    url = f"{config.BASE_URL}/exchange/v1/derivatives/futures/data/trades"
-    resp = _request_with_retry("GET", url, params={"pair": p})
+def fetch_current_price(
+    pair: Optional[str] = None,
+    cfg: Optional[StrategyConfig] = None,
+) -> float:
+    """Return the latest traded price via the trades endpoint."""
+    cfg = resolve_cfg(cfg)
+    p = pair or cfg.pair
+    url = f"{cfg.base_url}/exchange/v1/derivatives/futures/data/trades"
+    resp = _request_with_retry("GET", url, cfg=cfg, params={"pair": p})
     trades = resp.json()
     if not trades:
         raise ValueError(f"No trades returned for {p}")
@@ -56,19 +68,17 @@ def fetch_current_price(pair: Optional[str] = None) -> float:
     return price
 
 
-def fetch_price_x_minutes_ago(minutes: int) -> Optional[float]:
-    """
-    Try to get the price from ~`minutes` ago.
-
-    1. First check the local cache.
-    2. Fall back to the candlestick API (1-minute bars).
-    """
+def fetch_price_x_minutes_ago(
+    minutes: int,
+    cfg: Optional[StrategyConfig] = None,
+) -> Optional[float]:
+    """Try to get the price from ~``minutes`` ago (cache then candlestick)."""
     target_ts = time.time() - minutes * 60
     best = _find_closest_cached(target_ts)
     if best is not None:
         return best
 
-    return _fetch_candle_close(minutes)
+    return _fetch_candle_close(minutes, cfg=cfg)
 
 
 def _find_closest_cached(target_ts: float, tolerance_seconds: float = 120) -> Optional[float]:
@@ -85,26 +95,30 @@ def _find_closest_cached(target_ts: float, tolerance_seconds: float = 120) -> Op
     return None
 
 
-def _fetch_candle_close(minutes: int) -> float:
-    """Fetch a 1-minute candle covering `minutes` ago and return its close price."""
+def _fetch_candle_close(
+    minutes: int,
+    cfg: Optional[StrategyConfig] = None,
+) -> float:
+    """Fetch a 1-minute candle covering ``minutes`` ago and return its close."""
+    cfg = resolve_cfg(cfg)
     now = int(time.time())
     from_ts = now - (minutes + 2) * 60
     to_ts = now
 
-    url = f"{config.PUBLIC_URL}/market_data/candlesticks"
+    url = f"{cfg.public_url}/market_data/candlesticks"
     params = {
-        "pair": config.PAIR,
+        "pair": cfg.pair,
         "from": from_ts,
         "to": to_ts,
         "resolution": "1",
         "pcode": "f",
     }
-    resp = _request_with_retry("GET", url, params=params)
+    resp = _request_with_retry("GET", url, cfg=cfg, params=params)
     data = resp.json()
 
     candles = data.get("data", [])
     if not candles:
-        raise ValueError(f"No candle data returned for {config.PAIR} (window={minutes}m)")
+        raise ValueError(f"No candle data returned for {cfg.pair} (window={minutes}m)")
 
     target_epoch_ms = (now - minutes * 60) * 1000
     closest = min(candles, key=lambda c: abs(c["time"] - target_epoch_ms))
@@ -116,18 +130,18 @@ def _fetch_candle_close(minutes: int) -> float:
 
 _USDT_INR_CACHE_TTL = 60  # seconds
 
-def fetch_usdt_inr_rate() -> float:
+def fetch_usdt_inr_rate(cfg: Optional[StrategyConfig] = None) -> float:
     """Fetch the current USDT/INR exchange rate from CoinDCX spot ticker.
 
-    Returns the last traded price of USDT in INR.
     Results are cached for 60 seconds.
     """
+    cfg = resolve_cfg(cfg)
     now = time.time()
     if _usdt_inr_cache["rate"] is not None and (now - _usdt_inr_cache["ts"]) < _USDT_INR_CACHE_TTL:
         return _usdt_inr_cache["rate"]
 
-    url = f"{config.BASE_URL}/exchange/ticker"
-    resp = _request_with_retry("GET", url)
+    url = f"{cfg.base_url}/exchange/ticker"
+    resp = _request_with_retry("GET", url, cfg=cfg)
     tickers = resp.json()
     for t in tickers:
         if t.get("market") == "USDTINR":
@@ -139,20 +153,20 @@ def fetch_usdt_inr_rate() -> float:
     raise ValueError("USDT/INR pair not found in CoinDCX ticker data")
 
 
-def fetch_instrument_rules(pair: str, margin_currency: str = "INR") -> dict:
-    """Fetch and cache instrument constraints from CoinDCX.
-
-    Returns a dict with keys: ``min_quantity``, ``quantity_increment``,
-    ``price_increment``, ``min_notional``, ``max_quantity``,
-    ``max_market_order_quantity``.
-    """
+def fetch_instrument_rules(
+    pair: str,
+    margin_currency: str = "INR",
+    cfg: Optional[StrategyConfig] = None,
+) -> dict:
+    """Fetch and cache instrument constraints from CoinDCX."""
+    cfg = resolve_cfg(cfg)
     cache_key = f"{pair}:{margin_currency}"
     if cache_key in _instrument_cache:
         return _instrument_cache[cache_key]
 
-    url = f"{config.BASE_URL}/exchange/v1/derivatives/futures/data/instrument"
+    url = f"{cfg.base_url}/exchange/v1/derivatives/futures/data/instrument"
     resp = _request_with_retry(
-        "GET", url,
+        "GET", url, cfg=cfg,
         params={"pair": pair, "margin_currency_short_name": margin_currency},
     )
     data = resp.json()
@@ -197,17 +211,17 @@ def clear_cache() -> None:
     logger.info("Price cache cleared")
 
 
-def seed_cache() -> None:
-    """Pre-fill the cache with candles spanning the comparison window so the
-    first evaluation doesn't need to wait."""
-    window = config.COMPARISON_WINDOW_MINUTES
+def seed_cache(cfg: Optional[StrategyConfig] = None) -> None:
+    """Pre-fill the cache with candles spanning the comparison window."""
+    cfg = resolve_cfg(cfg)
+    window = cfg.comparison_window_minutes
     now = int(time.time())
     from_ts = now - (window + 5) * 60
     to_ts = now
 
-    url = f"{config.PUBLIC_URL}/market_data/candlesticks"
+    url = f"{cfg.public_url}/market_data/candlesticks"
     params = {
-        "pair": config.PAIR,
+        "pair": cfg.pair,
         "from": from_ts,
         "to": to_ts,
         "resolution": "1",
@@ -215,7 +229,7 @@ def seed_cache() -> None:
     }
 
     try:
-        resp = _request_with_retry("GET", url, params=params)
+        resp = _request_with_retry("GET", url, cfg=cfg, params=params)
         data = resp.json()
         candles = data.get("data", [])
         for c in candles:

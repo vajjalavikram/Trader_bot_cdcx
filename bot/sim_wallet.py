@@ -151,10 +151,20 @@ class SimWallet:
             raise ValueError(f"No open sim position with id {position_id}")
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
+        """Return copies of all currently open simulated positions.
+
+        Part of the public API — kept for programmatic/external callers even
+        though the Streamlit UI currently reads positions via ``snapshot()``.
+        """
         with self._lock:
             return [p.copy() for p in self.positions if p["status"] == "open"]
 
     def get_position_by_pair(self, pair: str) -> Optional[Dict[str, Any]]:
+        """Look up a single open position by trading pair.
+
+        Part of the public API — useful for callers that manage multiple
+        concurrent strategies on different pairs.
+        """
         with self._lock:
             for p in self.positions:
                 if p["pair"] == pair and p["status"] == "open":

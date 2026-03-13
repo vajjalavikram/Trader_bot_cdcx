@@ -11,18 +11,24 @@ Supports two modes:
 import logging
 from typing import Optional
 
-from bot import config
+from bot.strategy_config import StrategyConfig, resolve_cfg
 
 logger = logging.getLogger(__name__)
 
 
-def evaluate(current_price: float, past_price: float) -> Optional[str]:
+def evaluate(
+    current_price: float,
+    past_price: float,
+    cfg: Optional[StrategyConfig] = None,
+) -> Optional[str]:
     """
     Return the side to trade ("buy" or "sell") if the entry condition is met,
     otherwise return None.
 
     ``price_change`` is positive when price went up, negative when it went down.
     """
+    cfg = resolve_cfg(cfg)
+
     if past_price == 0:
         logger.warning("Past price is zero — skipping evaluation")
         return None
@@ -31,15 +37,15 @@ def evaluate(current_price: float, past_price: float) -> Optional[str]:
 
     logger.info(
         "Price change over %d min: %.4f%% (current=%.4f, past=%.4f)",
-        config.COMPARISON_WINDOW_MINUTES,
+        cfg.comparison_window_minutes,
         price_change,
         current_price,
         past_price,
     )
 
-    direction = config.DIRECTION
-    mode = config.STRATEGY_MODE
-    threshold = config.DIP_PERCENT
+    direction = cfg.direction
+    mode = cfg.strategy_mode
+    threshold = cfg.dip_percent
 
     triggered = False
 
