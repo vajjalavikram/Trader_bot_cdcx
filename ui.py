@@ -129,6 +129,21 @@ label { color: #9CA3AF !important; font-size: 0.82rem !important; }
 .mbadge-sim  { background: rgba(59,130,246,0.15); color: #3B82F6; }
 .mbadge-live { background: rgba(239,68,68,0.15);  color: #EF4444; }
 
+/* ── Status bar ────────────────────────────────────────────────────────── */
+.status-bar {
+    background: #111827; border-radius: 10px; padding: 10px 18px;
+    border: 1px solid rgba(255,255,255,0.05); margin-bottom: 12px;
+    display: flex; align-items: center; gap: 24px;
+    font-size: 0.82rem; color: #9CA3AF;
+}
+.status-bar .status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle;
+}
+.status-bar .status-item { white-space: nowrap; }
+.status-bar .status-val { color: #E5E7EB; font-weight: 600; }
+.status-bar .status-divider { color: rgba(255,255,255,0.1); }
+
 /* ── Strategy table ────────────────────────────────────────────────────── */
 [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
 [data-testid="stDataFrame"] table { font-size: 0.82rem; }
@@ -315,264 +330,402 @@ instr = st.session_state.instrument_rules
 preview_price = st.session_state.preview_price
 preview_usdt_inr = st.session_state.preview_usdt_inr
 
-# ── Mode banner ─────────────────────────────────────────────────────────
-if trading_mode == "Simulation":
-    st.info("**Simulation Mode** — no real trades will be executed.")
-else:
-    st.warning("**Live Trading Mode** — real orders will be executed.")
-
-# ── Main layout ─────────────────────────────────────────────────────────
-col_main, col_right = st.columns([3, 1], gap="medium")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# RIGHT PANEL — trading controls
-# ═══════════════════════════════════════════════════════════════════════════
-with col_right:
-
-    with st.container(border=True):
-        st.markdown('<p class="section-lbl">Position Settings</p>', unsafe_allow_html=True)
-        leverage = st.number_input("Leverage", min_value=1, max_value=125, value=10, step=1)
-
-        min_notional_val = 5.0
-        max_notional_val: Optional[float] = None
-        if instr:
-            min_notional_val = float(instr["min_notional"])
-            if margin_currency == "INR" and preview_usdt_inr:
-                min_notional_val = float(instr["min_notional"]) * preview_usdt_inr
-            if instr.get("max_notional"):
-                max_notional_val = float(instr["max_notional"])
-                if margin_currency == "INR" and preview_usdt_inr:
-                    max_notional_val = max_notional_val * preview_usdt_inr
-        min_notional_val = max(round(min_notional_val, 2), 1.0)
-        default_notional = (
-            max(min_notional_val * 2, 5000.0)
-            if margin_currency == "INR"
-            else max(min_notional_val * 2, 100.0)
-        )
-
-        notional_kwargs: dict = dict(
-            label=f"Notional ({margin_currency})",
-            min_value=min_notional_val, value=default_notional,
-            step=100.0 if margin_currency == "INR" else 10.0,
-            help="Total position value. Margin = Notional / Leverage.",
-        )
-        if max_notional_val and max_notional_val > min_notional_val:
-            notional_kwargs["max_value"] = max_notional_val
-        notional_value = st.number_input(**notional_kwargs)
-
-        if instr and preview_price and leverage > 0:
-            n_usdt = notional_value
-            if margin_currency == "INR" and preview_usdt_inr and preview_usdt_inr > 0:
-                n_usdt = notional_value / preview_usdt_inr
-            from bot.exchange_precision import snap_quantity as _base_snap
-            est_qty = _base_snap(n_usdt / preview_price, instr["quantity_increment"])
-            est_qty = max(est_qty, instr["min_quantity"])
-            margin_req_preview = notional_value / leverage
-            st.caption(
-                f"Qty ≈ {est_qty:.6f} · Margin {currency_symbol}{margin_req_preview:,.2f}"
-            )
-        order_type = st.selectbox("Order Type", ["market", "limit"])
-
-    with st.container(border=True):
-        st.markdown('<p class="section-lbl">Risk</p>', unsafe_allow_html=True)
-        tp_percent = st.number_input("Take Profit %", min_value=0.01, max_value=100.0, value=3.0, step=0.1)
-        sl_percent = st.number_input("Stop Loss %", min_value=0.01, max_value=100.0, value=2.0, step=0.1)
-
-    with st.container(border=True):
-        st.markdown('<p class="section-lbl">Direction</p>', unsafe_allow_html=True)
-        strategy_mode = st.selectbox("Strategy Mode", ["momentum", "reversal"])
-        direction = st.selectbox("Direction", ["LONG", "SHORT"])
-
-    with st.container(border=True):
-        st.markdown('<p class="section-lbl">Portfolio Risk</p>', unsafe_allow_html=True)
-        max_port_margin = st.number_input(
-            f"Max Portfolio Margin ({margin_currency})",
-            min_value=100.0, max_value=10_000_000.0,
-            value=float(mgr.max_portfolio_margin), step=1000.0,
-            help="Maximum total margin across all active strategies.",
-        )
-        mgr.max_portfolio_margin = max_port_margin
-
-    start_clicked = st.button("Start Strategy", use_container_width=True, type="primary")
-
-    active_ids = mgr.get_active_strategy_ids()
-    if active_ids:
-        stop_id = st.selectbox("Stop Strategy", active_ids, key="stop_select")
-        stop_clicked = st.button("Stop Selected", use_container_width=True)
-    else:
-        stop_id = None
-        stop_clicked = False
-
-    all_strats = mgr.get_all_strategies()
-    finished_ids = [
-        s["id"] for s in all_strats
-        if s["status"] in ("stopped", "expired", "closed", "error", "waiting")
-        and not s.get("is_alive")
-    ]
-    if finished_ids:
-        remove_id = st.selectbox("Remove Strategy", finished_ids, key="remove_select")
-        remove_clicked = st.button("Remove Selected", use_container_width=True)
-    else:
-        remove_id = None
-        remove_clicked = False
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Button logic
-# ═══════════════════════════════════════════════════════════════════════════
-if start_clicked:
-    if trading_mode == "Live" and (not api_key or not api_secret):
-        st.error("API Key and Secret are required for Live trading.")
-    else:
-        required_margin = notional_value / max(leverage, 1)
-        allowed, msg = mgr.can_start_strategy(required_margin)
-        if not allowed:
-            st.error(msg)
-        else:
-            params = {
-                "api_key": api_key, "api_secret": api_secret,
-                "pair": pair, "dip_percent": dip_percent,
-                "comparison_window_minutes": comparison_window,
-                "check_frequency_seconds": check_frequency,
-                "strategy_expiry_minutes": strategy_expiry,
-                "notional": notional_value, "leverage": leverage,
-                "order_type": order_type,
-                "take_profit_percent": tp_percent,
-                "stop_loss_percent": sl_percent,
-                "direction": direction, "strategy_mode": strategy_mode,
-                "margin_currency": margin_currency,
-                "trading_mode": trading_mode.lower(),
-                "sim_balance": sim_balance,
-            }
-            safe_params = {k: v for k, v in params.items() if k not in ("api_key", "api_secret")}
-            with open(RUNTIME_CONFIG_PATH, "w") as f:
-                json.dump(safe_params, f, indent=2)
-            sid = mgr.register_strategy(params)
-            mgr.start_strategy(sid)
-            st.rerun()
-
-if stop_clicked and stop_id:
-    mgr.stop_strategy(stop_id)
-    time.sleep(0.3)
-    st.rerun()
-
-if remove_clicked and remove_id:
-    mgr.remove_strategy(remove_id)
-    st.rerun()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CENTER DASHBOARD — auto-refreshing strategy table
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── System status bar (auto-refreshing) ──────────────────────────────────
 @st.fragment(run_every=timedelta(seconds=5))
-def _strategy_dashboard():
-    strategies = mgr.get_all_strategies()
+def _system_status_bar():
     summary = mgr.get_portfolio_summary()
-    mc = margin_currency
-    csym = "₹" if mc == "INR" else "$"
-    now = time.time()
-
-    # ── Portfolio summary metrics ──────────────────────────────────────
-    st.markdown(
-        '<p class="section-lbl" style="margin-top:0">Portfolio Overview</p>',
-        unsafe_allow_html=True,
+    csym = "₹" if margin_currency == "INR" else "$"
+    mode = st.session_state.trading_mode
+    active = summary["active_strategies"]
+    has_error = any(
+        s.get("status") == "error" for s in mgr.get_all_strategies()
     )
-    s1, s2, s3, s4 = st.columns(4)
-    with s1:
-        st.metric("Active Strategies", summary["active_strategies"])
-    with s2:
-        total_pnl = summary["total_pnl"]
-        st.metric(
-            "Total PnL",
-            f"{csym}{total_pnl:+,.2f}",
-            delta=f"{total_pnl:+,.2f}" if total_pnl != 0 else None,
-        )
-    with s3:
-        st.metric("Margin Used", f"{csym}{summary['margin_used']:,.2f}")
-    with s4:
-        st.metric("Available", f"{csym}{summary['margin_available']:,.2f}")
 
+    if has_error:
+        dot_color, sys_label = "#F59E0B", "Warning"
+    elif active > 0:
+        dot_color, sys_label = "#10B981", "Online"
+    else:
+        dot_color, sys_label = "#6B7280", "Idle"
+
+    pnl = summary["total_pnl"]
+    pnl_color = "#10B981" if pnl > 0 else "#EF4444" if pnl < 0 else "#9CA3AF"
+
+    bar_html = (
+        '<div class="status-bar">'
+        f'<span class="status-item">'
+        f'<span class="status-dot" style="background:{dot_color}"></span>'
+        f'<span class="status-val">{sys_label}</span></span>'
+        '<span class="status-divider">|</span>'
+        f'<span class="status-item">Mode: '
+        f'<span class="status-val">{mode}</span></span>'
+        '<span class="status-divider">|</span>'
+        f'<span class="status-item">Active Strategies: '
+        f'<span class="status-val">{active}</span></span>'
+        '<span class="status-divider">|</span>'
+        f'<span class="status-item">Margin Used: '
+        f'<span class="status-val">{csym}{summary["margin_used"]:,.0f}</span></span>'
+        '<span class="status-divider">|</span>'
+        f'<span class="status-item">Portfolio PnL: '
+        f'<span style="color:{pnl_color};font-weight:700">'
+        f'{csym}{pnl:+,.2f}</span></span>'
+        '</div>'
+    )
+    st.markdown(bar_html, unsafe_allow_html=True)
+
+_system_status_bar()
+
+# ── Tabs ─────────────────────────────────────────────────────────────────
+tab_guide, tab_terminal = st.tabs(["Guide", "Trading Terminal"])
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB: Trading Terminal
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_terminal:
+    if trading_mode == "Simulation":
+        st.info("**Simulation Mode** — no real trades will be executed.")
+    else:
+        st.warning("**Live Trading Mode** — real orders will be executed.")
+
+    col_main, col_right = st.columns([3, 1], gap="medium")
+
+    # ── Right panel — trading controls ───────────────────────────────
+    with col_right:
+        with st.container(border=True):
+            st.markdown('<p class="section-lbl">Position Settings</p>', unsafe_allow_html=True)
+            leverage = st.number_input("Leverage", min_value=1, max_value=125, value=10, step=1)
+
+            min_notional_val = 5.0
+            max_notional_val: Optional[float] = None
+            if instr:
+                min_notional_val = float(instr["min_notional"])
+                if margin_currency == "INR" and preview_usdt_inr:
+                    min_notional_val = float(instr["min_notional"]) * preview_usdt_inr
+                if instr.get("max_notional"):
+                    max_notional_val = float(instr["max_notional"])
+                    if margin_currency == "INR" and preview_usdt_inr:
+                        max_notional_val = max_notional_val * preview_usdt_inr
+            min_notional_val = max(round(min_notional_val, 2), 1.0)
+            default_notional = (
+                max(min_notional_val * 2, 5000.0)
+                if margin_currency == "INR"
+                else max(min_notional_val * 2, 100.0)
+            )
+
+            notional_kwargs: dict = dict(
+                label=f"Notional ({margin_currency})",
+                min_value=min_notional_val, value=default_notional,
+                step=100.0 if margin_currency == "INR" else 10.0,
+                help="Total position value. Margin = Notional / Leverage.",
+            )
+            if max_notional_val and max_notional_val > min_notional_val:
+                notional_kwargs["max_value"] = max_notional_val
+            notional_value = st.number_input(**notional_kwargs)
+
+            if instr and preview_price and leverage > 0:
+                n_usdt = notional_value
+                if margin_currency == "INR" and preview_usdt_inr and preview_usdt_inr > 0:
+                    n_usdt = notional_value / preview_usdt_inr
+                from bot.exchange_precision import snap_quantity as _base_snap
+                est_qty = _base_snap(n_usdt / preview_price, instr["quantity_increment"])
+                est_qty = max(est_qty, instr["min_quantity"])
+                margin_req_preview = notional_value / leverage
+                st.caption(
+                    f"Qty ≈ {est_qty:.6f} · Margin {currency_symbol}{margin_req_preview:,.2f}"
+                )
+            order_type = st.selectbox("Order Type", ["market", "limit"])
+
+        with st.container(border=True):
+            st.markdown('<p class="section-lbl">Risk</p>', unsafe_allow_html=True)
+            tp_percent = st.number_input("Take Profit %", min_value=0.01, max_value=100.0, value=3.0, step=0.1)
+            sl_percent = st.number_input("Stop Loss %", min_value=0.01, max_value=100.0, value=2.0, step=0.1)
+
+        with st.container(border=True):
+            st.markdown('<p class="section-lbl">Direction</p>', unsafe_allow_html=True)
+            strategy_mode = st.selectbox("Strategy Mode", ["momentum", "reversal"])
+            direction = st.selectbox("Direction", ["LONG", "SHORT"])
+
+        with st.container(border=True):
+            st.markdown('<p class="section-lbl">Portfolio Risk</p>', unsafe_allow_html=True)
+            max_port_margin = st.number_input(
+                f"Max Portfolio Margin ({margin_currency})",
+                min_value=100.0, max_value=10_000_000.0,
+                value=float(mgr.max_portfolio_margin), step=1000.0,
+                help="Maximum total margin across all active strategies.",
+            )
+            mgr.max_portfolio_margin = max_port_margin
+
+        start_clicked = st.button("Start Strategy", use_container_width=True, type="primary")
+
+        active_ids = mgr.get_active_strategy_ids()
+        if active_ids:
+            stop_id = st.selectbox("Stop Strategy", active_ids, key="stop_select")
+            stop_clicked = st.button("Stop Selected", use_container_width=True)
+        else:
+            stop_id = None
+            stop_clicked = False
+
+        all_strats = mgr.get_all_strategies()
+        finished_ids = [
+            s["id"] for s in all_strats
+            if s["status"] in ("stopped", "expired", "closed", "error", "waiting")
+            and not s.get("is_alive")
+        ]
+        if finished_ids:
+            remove_id = st.selectbox("Remove Strategy", finished_ids, key="remove_select")
+            remove_clicked = st.button("Remove Selected", use_container_width=True)
+        else:
+            remove_id = None
+            remove_clicked = False
+
+    # ── Button logic ─────────────────────────────────────────────────
+    if start_clicked:
+        if trading_mode == "Live" and (not api_key or not api_secret):
+            st.error("API Key and Secret are required for Live trading.")
+        else:
+            required_margin = notional_value / max(leverage, 1)
+            allowed, msg = mgr.can_start_strategy(required_margin)
+            if not allowed:
+                st.error(msg)
+            else:
+                params = {
+                    "api_key": api_key, "api_secret": api_secret,
+                    "pair": pair, "dip_percent": dip_percent,
+                    "comparison_window_minutes": comparison_window,
+                    "check_frequency_seconds": check_frequency,
+                    "strategy_expiry_minutes": strategy_expiry,
+                    "notional": notional_value, "leverage": leverage,
+                    "order_type": order_type,
+                    "take_profit_percent": tp_percent,
+                    "stop_loss_percent": sl_percent,
+                    "direction": direction, "strategy_mode": strategy_mode,
+                    "margin_currency": margin_currency,
+                    "trading_mode": trading_mode.lower(),
+                    "sim_balance": sim_balance,
+                }
+                safe_params = {k: v for k, v in params.items() if k not in ("api_key", "api_secret")}
+                with open(RUNTIME_CONFIG_PATH, "w") as f:
+                    json.dump(safe_params, f, indent=2)
+                sid = mgr.register_strategy(params)
+                mgr.start_strategy(sid)
+                st.rerun()
+
+    if stop_clicked and stop_id:
+        mgr.stop_strategy(stop_id)
+        time.sleep(0.3)
+        st.rerun()
+
+    if remove_clicked and remove_id:
+        mgr.remove_strategy(remove_id)
+        st.rerun()
+
+    # ── Center dashboard — auto-refreshing strategy table ────────────
+    @st.fragment(run_every=timedelta(seconds=5))
+    def _strategy_dashboard():
+        strategies = mgr.get_all_strategies()
+        summary = mgr.get_portfolio_summary()
+        mc = margin_currency
+        csym = "₹" if mc == "INR" else "$"
+        now = time.time()
+
+        st.markdown(
+            '<p class="section-lbl" style="margin-top:0">Portfolio Overview</p>',
+            unsafe_allow_html=True,
+        )
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.metric("Active Strategies", summary["active_strategies"])
+        with s2:
+            total_pnl = summary["total_pnl"]
+            st.metric(
+                "Total PnL",
+                f"{csym}{total_pnl:+,.2f}",
+                delta=f"{total_pnl:+,.2f}" if total_pnl != 0 else None,
+            )
+        with s3:
+            st.metric("Margin Used", f"{csym}{summary['margin_used']:,.2f}")
+        with s4:
+            st.metric("Available", f"{csym}{summary['margin_available']:,.2f}")
+
+        st.markdown('<hr class="hr">', unsafe_allow_html=True)
+
+        st.markdown(
+            '<p class="section-lbl">Active Strategies</p>',
+            unsafe_allow_html=True,
+        )
+
+        if not strategies:
+            st.caption("No strategies yet. Configure and start one from the right panel.")
+            return
+
+        rows = []
+        for s in strategies:
+            status_raw = s.get("status", "waiting")
+            s_direction = s.get("direction", "?")
+            mode = s.get("strategy_mode", "momentum")
+            pnl = s.get("pnl", 0) or 0
+            margin_val = s.get("margin", 0) or 0
+            notional_val = s.get("notional", 0) or 0
+            leverage_val = s.get("leverage", 0)
+            created = s.get("created_at", now)
+            expiry_min = s.get("strategy_expiry_minutes", 1440)
+            expiry_epoch = created + expiry_min * 60
+            remaining = expiry_epoch - now
+
+            rows.append({
+                "Strategy": _strategy_name(s_direction, mode),
+                "Pair": s.get("pair_label", "?"),
+                "Direction": s_direction,
+                "Mode": mode.title(),
+                "Leverage": f"{leverage_val}x",
+                "Margin": f"{csym}{margin_val:,.2f}",
+                "Notional": f"{csym}{notional_val:,.2f}",
+                "Status": _STATUS_LABELS.get(status_raw, status_raw.title()),
+                "Entry Price": _fmt_price(s.get("entry_price")),
+                "TP Price": _fmt_price(s.get("tp_price"), "—"),
+                "SL Price": _fmt_price(s.get("sl_price"), "—"),
+                "PnL": _fmt_pnl(pnl, csym),
+                "Running Time": _fmt_duration(now - created),
+                "Expiry Time": _fmt_duration(remaining) if remaining > 0 else "Expired",
+            })
+
+        df = pd.DataFrame(rows)
+
+        def _color_pnl(val: str):
+            if "+" in val:
+                return "color: #10B981; font-weight: 700"
+            if "-" in val:
+                return "color: #EF4444; font-weight: 700"
+            return "color: #6B7280"
+
+        styled = df.style.map(_color_pnl, subset=["PnL"])
+
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    with col_main:
+        _strategy_dashboard()
+
+    # ── Bottom — full-width event feed ───────────────────────────────
     st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
-    # ── Strategy table ────────────────────────────────────────────────
-    st.markdown(
-        '<p class="section-lbl">Active Strategies</p>',
-        unsafe_allow_html=True,
-    )
+    @st.fragment(run_every=timedelta(seconds=5))
+    def _event_feed():
+        logs = list(mgr.logs)
+        st.markdown(
+            '<p class="section-lbl" style="margin-top:4px">Trading Events</p>',
+            unsafe_allow_html=True,
+        )
+        with st.expander("Event Log", expanded=bool(logs)):
+            if logs:
+                st.text_area("logs_main", value="\n".join(logs[-100:]), height=240,
+                             disabled=True, label_visibility="collapsed")
+            else:
+                st.caption("No events yet — start a strategy to see activity here.")
 
-    if not strategies:
-        st.caption("No strategies yet. Configure and start one from the right panel.")
-        return
-
-    rows = []
-    for s in strategies:
-        status_raw = s.get("status", "waiting")
-        direction = s.get("direction", "?")
-        mode = s.get("strategy_mode", "momentum")
-        pnl = s.get("pnl", 0) or 0
-        margin_val = s.get("margin", 0) or 0
-        notional_val = s.get("notional", 0) or 0
-        leverage_val = s.get("leverage", 0)
-        created = s.get("created_at", now)
-        expiry_min = s.get("strategy_expiry_minutes", 1440)
-        expiry_epoch = created + expiry_min * 60
-        remaining = expiry_epoch - now
-
-        rows.append({
-            "Strategy": _strategy_name(direction, mode),
-            "Pair": s.get("pair_label", "?"),
-            "Direction": direction,
-            "Mode": mode.title(),
-            "Leverage": f"{leverage_val}x",
-            "Margin": f"{csym}{margin_val:,.2f}",
-            "Notional": f"{csym}{notional_val:,.2f}",
-            "Status": _STATUS_LABELS.get(status_raw, status_raw.title()),
-            "Entry Price": _fmt_price(s.get("entry_price")),
-            "TP Price": _fmt_price(s.get("tp_price"), "—"),
-            "SL Price": _fmt_price(s.get("sl_price"), "—"),
-            "PnL": _fmt_pnl(pnl, csym),
-            "Running Time": _fmt_duration(now - created),
-            "Expiry Time": _fmt_duration(remaining) if remaining > 0 else "Expired",
-        })
-
-    df = pd.DataFrame(rows)
-
-    def _color_pnl(val: str):
-        if "+" in val:
-            return "color: #10B981; font-weight: 700"
-        if "-" in val:
-            return "color: #EF4444; font-weight: 700"
-        return "color: #6B7280"
-
-    styled = df.style.map(_color_pnl, subset=["PnL"])
-
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-
-with col_main:
-    _strategy_dashboard()
-
+    _event_feed()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# BOTTOM — full-width event feed
+# TAB: Guide
 # ═══════════════════════════════════════════════════════════════════════════
-st.markdown('<hr class="hr">', unsafe_allow_html=True)
+with tab_guide:
 
-
-@st.fragment(run_every=timedelta(seconds=5))
-def _event_feed():
-    logs = list(mgr.logs)
+    st.subheader("Automated Futures Strategy Bot")
     st.markdown(
-        '<p class="section-lbl" style="margin-top:4px">Trading Events</p>',
-        unsafe_allow_html=True,
+        "This bot allows users to create automated futures trading strategies on "
+        "CoinDCX. It continuously monitors market prices and executes trades "
+        "automatically when strategy conditions are met.\n\n"
+        "You can run **multiple strategies simultaneously** while portfolio "
+        "guardrails prevent excessive margin usage."
     )
-    with st.expander("Event Log", expanded=bool(logs)):
-        if logs:
-            st.text_area("logs_main", value="\n".join(logs[-100:]), height=240,
-                         disabled=True, label_visibility="collapsed")
-        else:
-            st.caption("No events yet — start a strategy to see activity here.")
 
+    st.markdown("---")
 
-_event_feed()
+    # ── How Strategies Work ──────────────────────────────────────────
+    st.subheader("How Strategies Work")
+    st.markdown(
+        "**Dip / Rise Strategy** — Opens a position when the price moves by a "
+        "specified percentage within a configured time window.\n\n"
+        "**Momentum Mode** — Follows the direction of the price movement. "
+        "A LONG triggers when price rises by the dip %; a SHORT triggers when "
+        "price falls.\n\n"
+        "**Reversal Mode** — Trades against the short-term movement. "
+        "A LONG triggers when price *drops* by the dip %; a SHORT triggers when "
+        "price *rises*."
+    )
+
+    st.markdown("---")
+
+    # ── How To Run A Strategy ────────────────────────────────────────
+    st.subheader("How To Run A Strategy")
+    st.markdown(
+        "1. Select a **trading pair** (BTC, ETH, SOL) in the sidebar.\n"
+        "2. Choose **leverage** in the right panel.\n"
+        "3. Set the **position notional** (total position value).\n"
+        "4. Configure **dip %** and **comparison window** in the sidebar.\n"
+        "5. Set **Take Profit %** and **Stop Loss %**.\n"
+        "6. Click **Start Strategy**.\n\n"
+        "The strategy will begin scanning the market at the configured frequency. "
+        "When the entry condition is met, an order is placed automatically."
+    )
+
+    st.markdown("---")
+
+    # ── Live System Status ───────────────────────────────────────────
+    st.subheader("Live System Status")
+
+    @st.fragment(run_every=timedelta(seconds=5))
+    def _guide_live_status():
+        summary = mgr.get_portfolio_summary()
+        csym = "₹" if margin_currency == "INR" else "$"
+        g1, g2, g3, g4 = st.columns(4)
+        with g1:
+            st.metric("Active Strategies", summary["active_strategies"])
+        with g2:
+            st.metric("Margin Used", f"{csym}{summary['margin_used']:,.2f}")
+        with g3:
+            st.metric("Available", f"{csym}{summary['margin_available']:,.2f}")
+        with g4:
+            st.metric("Total PnL", f"{csym}{summary['total_pnl']:+,.2f}")
+        st.markdown(f"**Trading Mode:** {st.session_state.trading_mode}")
+
+    _guide_live_status()
+
+    st.markdown("---")
+
+    # ── Strategy Lifecycle ───────────────────────────────────────────
+    st.subheader("Strategy Lifecycle")
+    st.markdown(
+        "| Status | Meaning |\n"
+        "|---|---|\n"
+        "| **Scanning** | Waiting for the entry signal |\n"
+        "| **Order Placed** | Entry order submitted to the exchange |\n"
+        "| **Open** | Position is currently active |\n"
+        "| **Closed** | Position exited via TP or SL |\n"
+        "| **Expired** | Strategy timed out before finding an entry |\n"
+        "| **Error** | Strategy encountered an issue |"
+    )
+
+    st.markdown("---")
+
+    # ── Risk Guardrails ──────────────────────────────────────────────
+    st.subheader("Risk Guardrails")
+    st.markdown(
+        "The system enforces a **maximum portfolio margin** limit. This prevents "
+        "too many strategies from opening positions simultaneously and limits "
+        "total capital at risk.\n\n"
+        "Before a new strategy can start, the bot checks that the required margin "
+        "fits within the remaining portfolio budget."
+    )
+
+    st.markdown("---")
+
+    # ── Where To Look ────────────────────────────────────────────────
+    st.subheader("Where To Look In The Dashboard")
+    st.markdown(
+        "| Area | What It Shows |\n"
+        "|---|---|\n"
+        "| **Strategy Table** | All running strategies with status, PnL, and prices |\n"
+        "| **Portfolio Summary** | Aggregate margin usage and PnL across strategies |\n"
+        "| **Sidebar Logs** | System events, API calls, and debugging information |\n"
+        "| **Event Log** | Timestamped trading activity feed |"
+    )
