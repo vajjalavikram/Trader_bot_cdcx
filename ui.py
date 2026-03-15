@@ -8,10 +8,12 @@ Run with:
 import json
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
+import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 from bot.strategy_manager import StrategyManager
@@ -250,6 +252,65 @@ def _strategy_name(direction: str, strategy_mode: str) -> str:
     return "Buy Rise" if direction == "LONG" else "Sell Dip"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Market Viewer — cached data fetchers
+# ═══════════════════════════════════════════════════════════════════════════
+_MV_BASE_URL = "https://api.coindcx.com"
+_MV_PUBLIC_URL = "https://public.coindcx.com"
+
+_MV_INTERVAL_SECONDS = {"1": 60, "5": 300, "60": 3600, "1D": 86400}
+_MV_INTERVAL_LABELS = {"1": "1 min", "5": "5 min", "60": "1 hour", "1D": "1 day"}
+
+
+@st.cache_data(ttl=2)
+def _mv_fetch_trades(instrument: str):
+    resp = requests.get(
+        f"{_MV_BASE_URL}/exchange/v1/derivatives/futures/data/trades",
+        params={"pair": instrument}, timeout=5,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=2)
+def _mv_fetch_candles(instrument: str, resolution: str, from_ts: int, to_ts: int):
+    resp = requests.get(
+        f"{_MV_PUBLIC_URL}/market_data/candlesticks",
+        params={
+            "pair": instrument, "resolution": resolution,
+            "from": from_ts, "to": to_ts, "pcode": "f",
+        },
+        timeout=5,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", data if isinstance(data, list) else [])
+
+
+@st.cache_data(ttl=2)
+def _mv_fetch_orderbook(instrument: str):
+    resp = requests.get(
+        f"{_MV_PUBLIC_URL}/market_data/v3/orderbook/{instrument}-futures/50",
+        timeout=5,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _parse_ob_entries(raw) -> list[dict]:
+    """Normalise orderbook entries into [{Price, Quantity}] dicts."""
+    rows = []
+    for entry in raw:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            rows.append({"Price": float(entry[0]), "Quantity": float(entry[1])})
+        elif isinstance(entry, dict):
+            rows.append({
+                "Price": float(entry.get("price", entry.get("rate", 0))),
+                "Quantity": float(entry.get("quantity", entry.get("amount", 0))),
+            })
+    return rows
+
+
 # ###########################################################################
 #                              UI  LAYOUT
 # ###########################################################################
@@ -376,7 +437,7 @@ def _system_status_bar():
 _system_status_bar()
 
 # ── Tabs ─────────────────────────────────────────────────────────────────
-tab_guide, tab_terminal = st.tabs(["Guide", "Trading Terminal"])
+tab_guide, tab_market, tab_terminal = st.tabs(["Guide", "Market Viewer", "Trading Terminal"])
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB: Trading Terminal
@@ -623,6 +684,187 @@ with tab_terminal:
                 st.caption("No events yet — start a strategy to see activity here.")
 
     _event_feed()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB: Market Viewer
+# ═══════════════════════════════════════════════════════════════════════════
+with tab_market:
+
+    @st.fragment(run_every=timedelta(seconds=5))
+    def _market_viewer():
+        # ── Controls row ─────────────────────────────────────────────
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            mv_pair_label = st.selectbox(
+                "Token", sorted(PAIR_OPTIONS.keys()), key="mv_token",
+            )
+        with c2:
+            mv_interval = st.selectbox(
+                "Chart Interval", list(_MV_INTERVAL_LABELS.keys()),
+                format_func=lambda x: _MV_INTERVAL_LABELS[x],
+                index=2, key="mv_interval",
+            )
+        with c3:
+            mv_window = st.number_input(
+                "Strategy Comparison Window (hours)",
+                min_value=1, max_value=72, value=1, key="mv_window",
+            )
+
+        instrument = PAIR_OPTIONS[mv_pair_label]
+        now_ts = int(time.time())
+
+        # ── Fetch live trades (used for LTP + recent trades table) ───
+        trades: list = []
+        ltp: Optional[float] = None
+        try:
+            trades = _mv_fetch_trades(instrument)
+            if trades:
+                ltp = float(trades[-1]["price"])
+        except Exception:
+            pass
+
+        # ── Price change over strategy window ────────────────────────
+        price_change: Optional[float] = None
+        try:
+            w_from = now_ts - mv_window * 3600
+            w_candles = _mv_fetch_candles(instrument, "60", w_from, now_ts)
+            if w_candles and ltp is not None:
+                past_price = float(w_candles[0]["close"])
+                if past_price > 0:
+                    price_change = ((ltp - past_price) / past_price) * 100
+        except Exception:
+            pass
+
+        # ── Metrics row: LTP + Price Change ──────────────────────────
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric("LTP", f"{ltp:,.4f}" if ltp is not None else "—")
+        with m2:
+            if price_change is not None:
+                st.metric(
+                    f"Price Change ({mv_window}h)",
+                    f"{price_change:+.2f}%",
+                    delta=f"{price_change:+.2f}%",
+                )
+            else:
+                st.metric(f"Price Change ({mv_window}h)", "—")
+
+        st.markdown('<hr class="hr">', unsafe_allow_html=True)
+
+        # ── Candlestick chart ────────────────────────────────────────
+        try:
+            lookback = 200 * _MV_INTERVAL_SECONDS[mv_interval]
+            chart_from = now_ts - lookback
+            candles = _mv_fetch_candles(instrument, mv_interval, chart_from, now_ts)
+
+            if candles:
+                times = [datetime.utcfromtimestamp(c["time"] / 1000) for c in candles]
+                fig = go.Figure(data=[
+                    go.Candlestick(
+                        x=times,
+                        open=[float(c["open"]) for c in candles],
+                        high=[float(c["high"]) for c in candles],
+                        low=[float(c["low"]) for c in candles],
+                        close=[float(c["close"]) for c in candles],
+                        increasing_line_color="#10B981",
+                        decreasing_line_color="#EF4444",
+                        increasing_fillcolor="rgba(16,185,129,0.35)",
+                        decreasing_fillcolor="rgba(239,68,68,0.35)",
+                    )
+                ])
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="#111827",
+                    plot_bgcolor="#0B0F19",
+                    xaxis=dict(
+                        gridcolor="rgba(255,255,255,0.04)",
+                        rangeslider_visible=False,
+                    ),
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.04)"),
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    height=420,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.caption("No chart data available for this instrument.")
+        except Exception:
+            st.caption("Market data temporarily unavailable.")
+
+        st.markdown('<hr class="hr">', unsafe_allow_html=True)
+
+        # ── Orderbook (top 5 bids + asks) ────────────────────────────
+        try:
+            ob = _mv_fetch_orderbook(instrument)
+            bids_raw = ob.get("bids", [])[:5]
+            asks_raw = ob.get("asks", [])[:5]
+
+            ob1, ob2 = st.columns(2)
+            with ob1:
+                st.markdown(
+                    '<p class="section-lbl">Buy Orders (Bids)</p>',
+                    unsafe_allow_html=True,
+                )
+                bid_rows = _parse_ob_entries(bids_raw)
+                if bid_rows:
+                    st.dataframe(
+                        pd.DataFrame(bid_rows),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.caption("No bids available.")
+            with ob2:
+                st.markdown(
+                    '<p class="section-lbl">Sell Orders (Asks)</p>',
+                    unsafe_allow_html=True,
+                )
+                ask_rows = _parse_ob_entries(asks_raw)
+                if ask_rows:
+                    st.dataframe(
+                        pd.DataFrame(ask_rows),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.caption("No asks available.")
+        except Exception:
+            st.caption("Orderbook data temporarily unavailable.")
+
+        st.markdown('<hr class="hr">', unsafe_allow_html=True)
+
+        # ── Recent trades ────────────────────────────────────────────
+        try:
+            if trades:
+                st.markdown(
+                    '<p class="section-lbl">Recent Trades</p>',
+                    unsafe_allow_html=True,
+                )
+                recent = trades[-10:][::-1]
+                trade_rows = []
+                for t in recent:
+                    ts_raw = t.get("timestamp", t.get("T", t.get("time", "")))
+                    if isinstance(ts_raw, (int, float)):
+                        if ts_raw > 1e12:
+                            ts_raw = ts_raw / 1000
+                        ts_str = datetime.utcfromtimestamp(ts_raw).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                    else:
+                        ts_str = str(ts_raw)
+
+                    trade_rows.append({
+                        "Price": float(t.get("price", 0)),
+                        "Quantity": float(t.get("quantity", t.get("q", 0))),
+                        "Time": ts_str,
+                    })
+                st.dataframe(
+                    pd.DataFrame(trade_rows),
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.caption("No recent trades available.")
+        except Exception:
+            st.caption("Recent trades temporarily unavailable.")
+
+    _market_viewer()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TAB: Guide

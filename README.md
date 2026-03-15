@@ -235,6 +235,35 @@ Uses [ngrok](https://ngrok.com/) to expose the Streamlit dashboard with a public
 
 ---
 
+## Railway Deployment
+
+This project can be deployed to [Railway](https://railway.app/).
+
+### Steps
+
+1. Push the repository to GitHub (ensure `.env` is in `.gitignore`).
+2. Create a new project on Railway and connect the GitHub repository.
+3. Railway will detect the `Procfile` and install dependencies from `requirements.txt`.
+4. Add your API credentials as environment variables in the Railway dashboard (never commit them).
+5. The app runs with:
+
+```
+streamlit run ui.py --server.port=$PORT --server.address=0.0.0.0
+```
+
+The deployed app will be accessible via the Railway public URL.
+
+### Deployment Files
+
+| File | Purpose |
+|---|---|
+| `Procfile` | Tells Railway how to start the Streamlit app |
+| `runtime.txt` | Pins the Python version to 3.11 |
+| `.streamlit/config.toml` | Headless server config for cloud environments |
+| `requirements.txt` | Python package dependencies |
+
+---
+
 ## Deployment — Streamlit Cloud
 
 1. Push the repository to GitHub (ensure `.env` is in `.gitignore`).

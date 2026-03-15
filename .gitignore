@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .venv
 runtime_config.json
+.streamlit/secrets.toml
