@@ -5,6 +5,13 @@ instantiates a ``BackendClient`` instead of a local ``StrategyManager``.
 Every public method matches the manager's signature so the rest of the UI
 code is completely agnostic about which mode it is running in.
 
+All API calls target the ``/api`` prefix explicitly::
+
+    GET  /api/health
+    POST /api/session/load
+    GET  /api/strategies
+    POST /api/strategy/start
+
 Identity is conveyed via the ``X-API-Key`` header on every request.
 """
 
@@ -60,7 +67,7 @@ class BackendClient:
 
     def _sync_settings(self) -> None:
         try:
-            resp = self._get("/settings")
+            resp = self._get("/api/settings")
             if resp.ok:
                 self._max_portfolio_margin = resp.json()["max_portfolio_margin"]
         except Exception:
@@ -75,10 +82,10 @@ class BackendClient:
         secret: str,
         remember_secret: bool = False,
     ) -> Dict[str, Any]:
-        """Call ``POST /session/load`` and return the response dict."""
+        """Call ``POST /api/session/load`` and return the response dict."""
         try:
             resp = _req.post(
-                f"{self._url}/session/load",
+                f"{self._url}/api/session/load",
                 json={
                     "api_key": api_key,
                     "secret": secret,
@@ -98,7 +105,7 @@ class BackendClient:
     @property
     def logs(self) -> deque:
         try:
-            resp = self._get("/logs")
+            resp = self._get("/api/logs")
             if resp.ok:
                 self._logs = deque(resp.json(), maxlen=2000)
         except Exception:
@@ -117,7 +124,7 @@ class BackendClient:
     def max_portfolio_margin(self, value: float) -> None:
         self._max_portfolio_margin = value
         try:
-            self._put("/settings/max-margin", json={"value": value})
+            self._put("/api/settings/max-margin", json={"value": value})
         except Exception:
             pass
 
@@ -126,7 +133,7 @@ class BackendClient:
     # ------------------------------------------------------------------
     def register_strategy(self, params: dict) -> str:
         try:
-            resp = self._post("/strategy/start", json={"params": params})
+            resp = self._post("/api/strategy/start", json={"params": params})
             resp.raise_for_status()
             return resp.json()["strategy_id"]
         except _req.exceptions.RequestException as exc:
@@ -134,12 +141,12 @@ class BackendClient:
             raise RuntimeError("Backend unreachable — could not start strategy.") from exc
 
     def start_strategy(self, strategy_id: str) -> bool:
-        """Backend's ``/strategy/start`` already starts the strategy."""
+        """Backend's ``/api/strategy/start`` already starts the strategy."""
         return True
 
     def stop_strategy(self, strategy_id: str) -> bool:
         try:
-            resp = self._post("/strategy/stop", json={"strategy_id": strategy_id})
+            resp = self._post("/api/strategy/stop", json={"strategy_id": strategy_id})
             return resp.ok and resp.json().get("success", False)
         except _req.exceptions.RequestException as exc:
             logger.error("stop_strategy failed: %s", exc)
@@ -147,7 +154,7 @@ class BackendClient:
 
     def remove_strategy(self, strategy_id: str) -> bool:
         try:
-            resp = self._delete(f"/strategy/{strategy_id}")
+            resp = self._delete(f"/api/strategy/{strategy_id}")
             return resp.ok and resp.json().get("success", False)
         except _req.exceptions.RequestException as exc:
             logger.error("remove_strategy failed: %s", exc)
@@ -158,7 +165,7 @@ class BackendClient:
     # ------------------------------------------------------------------
     def get_all_strategies(self) -> List[Dict[str, Any]]:
         try:
-            resp = self._get("/strategies")
+            resp = self._get("/api/strategies")
             if resp.ok:
                 return resp.json()
         except Exception:
@@ -167,7 +174,7 @@ class BackendClient:
 
     def get_active_strategy_ids(self) -> List[str]:
         try:
-            resp = self._get("/strategies/active/ids")
+            resp = self._get("/api/strategies/active/ids")
             if resp.ok:
                 return resp.json()
         except Exception:
@@ -181,7 +188,7 @@ class BackendClient:
             "margin_used": 0.0, "margin_available": 0.0,
         }
         try:
-            resp = self._get("/portfolio")
+            resp = self._get("/api/portfolio")
             if resp.ok:
                 return resp.json()
         except Exception:
@@ -191,7 +198,7 @@ class BackendClient:
     def can_start_strategy(self, required_margin: float) -> Tuple[bool, str]:
         try:
             resp = self._post(
-                "/strategy/margin-check", json={"margin": required_margin},
+                "/api/strategy/margin-check", json={"margin": required_margin},
             )
             if resp.ok:
                 data = resp.json()
@@ -204,9 +211,9 @@ class BackendClient:
     # Health
     # ------------------------------------------------------------------
     def health_check(self) -> bool:
-        """Return ``True`` if the backend responds to ``GET /health``."""
+        """Return ``True`` if the backend responds to ``GET /api/health``."""
         try:
-            resp = _req.get(f"{self._url}/health", timeout=2)
+            resp = _req.get(f"{self._url}/api/health", timeout=2)
             return resp.ok
         except _req.exceptions.RequestException:
             return False

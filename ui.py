@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-_BACKEND_URL = os.getenv("BACKEND_URL", "")
+_BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Page configuration (must be the first Streamlit call)
@@ -173,13 +173,8 @@ PAIR_OPTIONS = {
 # Session-state initialisation
 # ═══════════════════════════════════════════════════════════════════════════
 if "strategy_manager" not in st.session_state:
-    if _BACKEND_URL:
-        from backend.client import BackendClient
-        st.session_state.strategy_manager = BackendClient(_BACKEND_URL)
-    else:
-        from bot.strategy_manager import StrategyManager
-        st.session_state.strategy_manager = StrategyManager()
-        st.session_state.strategy_manager.recover_session()
+    from backend.client import BackendClient
+    st.session_state.strategy_manager = BackendClient(_BACKEND_URL)
 if "instrument_rules" not in st.session_state:
     st.session_state.instrument_rules = None
 if "preview_price" not in st.session_state:
@@ -190,20 +185,21 @@ if "trading_mode" not in st.session_state:
     st.session_state.trading_mode = "Simulation"
 if "live_trading_enabled" not in st.session_state:
     st.session_state.live_trading_enabled = False
+if "connected" not in st.session_state:
+    st.session_state.connected = False
 
 mgr = st.session_state.strategy_manager
 
 # ── Backend health check (non-blocking) ──────────────────────────────────
-if _BACKEND_URL:
-    try:
-        _backend_ok = mgr.health_check()
-    except Exception:
-        _backend_ok = False
-    if not _backend_ok:
-        st.warning(
-            "Backend server is not reachable. "
-            "Live trading features may be unavailable."
-        )
+try:
+    _backend_ok = mgr.health_check()
+except Exception:
+    _backend_ok = False
+if not _backend_ok:
+    st.warning(
+        "Backend server is not reachable. "
+        "Start it with: uvicorn backend.main:app --port 8000"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -378,64 +374,58 @@ with st.sidebar:
         "_backend_api_secret", os.getenv("COINDCX_API_SECRET", ""),
     )
 
-    if trading_mode == "Live":
-        _live_ok = st.session_state.live_trading_enabled
-        with st.expander(
-            "Live Trading Connection",
-            expanded=not _live_ok,
-        ):
-            if _live_ok:
-                st.success("Connected — live trading enabled.")
-            else:
-                st.caption(
-                    "Enter your CoinDCX API key to enable live trading."
-                )
-            _in_key = st.text_input(
-                "CoinDCX API Key", type="password",
-                value=api_key, key="live_key",
+    _connected = st.session_state.connected
+    with st.expander(
+        "Backend Connection",
+        expanded=not _connected,
+    ):
+        if _connected:
+            st.success("Connected — backend session active.")
+        else:
+            st.caption(
+                "Connect your CoinDCX API key to load strategies."
             )
-            _in_secret = st.text_input(
-                "CoinDCX API Secret", type="password",
-                value=api_secret, key="live_secret",
-            )
-            _remember = False
-            if _BACKEND_URL:
-                _remember = st.checkbox(
-                    "Remember API Secret (encrypted)", key="live_remember",
-                )
+        _in_key = st.text_input(
+            "CoinDCX API Key", type="password",
+            value=api_key, key="live_key",
+        )
+        _in_secret = st.text_input(
+            "CoinDCX API Secret", type="password",
+            value=api_secret, key="live_secret",
+        )
+        _remember = st.checkbox(
+            "Remember API Secret (encrypted)", key="live_remember",
+        )
 
-            if not _live_ok:
-                if st.button(
-                    "Connect", type="primary",
-                    use_container_width=True, key="live_connect",
-                ):
-                    if not _in_key or not _in_secret:
-                        st.error("Both API Key and API Secret are required.")
+        if not _connected:
+            if st.button(
+                "Connect", type="primary",
+                use_container_width=True, key="live_connect",
+            ):
+                if not _in_key or not _in_secret:
+                    st.error("Both API Key and API Secret are required.")
+                else:
+                    _result = mgr.load_session(
+                        api_key=_in_key,
+                        secret=_in_secret,
+                        remember_secret=_remember,
+                    )
+                    if _result and _result.get("user_id"):
+                        mgr.set_api_key(_in_key)
+                        st.session_state["_backend_api_key"] = _in_key
+                        st.session_state["_backend_api_secret"] = _in_secret
+                        st.session_state.connected = True
+                        st.session_state.live_trading_enabled = True
+                        st.rerun()
                     else:
-                        _connect_ok = True
-                        if _BACKEND_URL:
-                            _result = mgr.load_session(
-                                api_key=_in_key,
-                                secret=_in_secret,
-                                remember_secret=_remember,
-                            )
-                            if _result and _result.get("user_id"):
-                                mgr.set_api_key(_in_key)
-                            else:
-                                st.error(
-                                    "Could not connect to backend. "
-                                    "Check your keys and try again."
-                                )
-                                _connect_ok = False
-                        if _connect_ok:
-                            st.session_state["_backend_api_key"] = _in_key
-                            st.session_state["_backend_api_secret"] = _in_secret
-                            st.session_state.live_trading_enabled = True
-                            st.rerun()
+                        st.error(
+                            "Could not connect to backend. "
+                            "Check your keys and try again."
+                        )
 
-            api_key = _in_key
-            api_secret = _in_secret
-        st.markdown('<hr class="hr">', unsafe_allow_html=True)
+        api_key = _in_key
+        api_secret = _in_secret
+    st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
     st.markdown('<p class="section-lbl">Instrument</p>', unsafe_allow_html=True)
     pair_label = st.selectbox("Pair", list(PAIR_OPTIONS.keys()))
@@ -453,14 +443,15 @@ with st.sidebar:
 
     st.markdown('<p class="section-lbl">System Logs</p>', unsafe_allow_html=True)
     with st.expander("Logs", expanded=False):
-        try:
-            _sidebar_logs = list(mgr.logs)
-        except Exception:
-            _sidebar_logs = []
         if "logs_cache" not in st.session_state:
             st.session_state.logs_cache = []
-        if _sidebar_logs:
-            st.session_state.logs_cache = _sidebar_logs
+        if st.session_state.connected:
+            try:
+                _sidebar_logs = list(mgr.logs)
+            except Exception:
+                _sidebar_logs = []
+            if _sidebar_logs:
+                st.session_state.logs_cache = _sidebar_logs
         _display_logs = st.session_state.logs_cache
         if _display_logs:
             st.text_area("log_output", value="\n".join(_display_logs[-150:]), height=300,
@@ -483,13 +474,17 @@ def _system_status_bar():
         "active_strategies": 0, "total_pnl": 0.0,
         "margin_used": 0.0, "margin_available": 0.0,
     }
-    try:
-        summary = mgr.get_portfolio_summary() or _fallback_summary
-    except Exception:
+    if st.session_state.connected:
+        try:
+            summary = mgr.get_portfolio_summary() or _fallback_summary
+        except Exception:
+            summary = _fallback_summary
+        try:
+            all_strats = mgr.get_all_strategies() or []
+        except Exception:
+            all_strats = []
+    else:
         summary = _fallback_summary
-    try:
-        all_strats = mgr.get_all_strategies() or []
-    except Exception:
         all_strats = []
 
     csym = "₹" if margin_currency == "INR" else "$"
@@ -603,19 +598,27 @@ with tab_terminal:
 
         with st.container(border=True):
             st.markdown('<p class="section-lbl">Portfolio Risk</p>', unsafe_allow_html=True)
+            _margin_default = (
+                float(mgr.max_portfolio_margin)
+                if st.session_state.connected else 50_000.0
+            )
             max_port_margin = st.number_input(
                 f"Max Portfolio Margin ({margin_currency})",
                 min_value=100.0, max_value=10_000_000.0,
-                value=float(mgr.max_portfolio_margin), step=1000.0,
+                value=_margin_default, step=1000.0,
                 help="Maximum total margin across all active strategies.",
             )
-            mgr.max_portfolio_margin = max_port_margin
+            if st.session_state.connected:
+                mgr.max_portfolio_margin = max_port_margin
 
         start_clicked = st.button("Start Strategy", use_container_width=True, type="primary")
 
-        try:
-            active_ids = mgr.get_active_strategy_ids() or []
-        except Exception:
+        if st.session_state.connected:
+            try:
+                active_ids = mgr.get_active_strategy_ids() or []
+            except Exception:
+                active_ids = []
+        else:
             active_ids = []
         if active_ids:
             stop_id = st.selectbox("Stop Strategy", active_ids, key="stop_select")
@@ -624,9 +627,12 @@ with tab_terminal:
             stop_id = None
             stop_clicked = False
 
-        try:
-            all_strats = mgr.get_all_strategies() or []
-        except Exception:
+        if st.session_state.connected:
+            try:
+                all_strats = mgr.get_all_strategies() or []
+            except Exception:
+                all_strats = []
+        else:
             all_strats = []
         finished_ids = [
             s["id"] for s in all_strats
@@ -642,10 +648,10 @@ with tab_terminal:
 
     # ── Button logic ─────────────────────────────────────────────────
     if start_clicked:
-        if trading_mode == "Live" and not st.session_state.live_trading_enabled:
+        if not st.session_state.connected:
             st.error(
-                "Connect your CoinDCX API keys first. "
-                "Open **Live Trading Connection** in the sidebar."
+                "Connect your CoinDCX API key first. "
+                "Open **Backend Connection** in the sidebar."
             )
         else:
             required_margin = notional_value / max(leverage, 1)
@@ -691,6 +697,9 @@ with tab_terminal:
             "active_strategies": 0, "total_pnl": 0.0,
             "margin_used": 0.0, "margin_available": 0.0,
         }
+        if not st.session_state.connected:
+            st.caption("Connect your CoinDCX API key to load strategies.")
+            return
         try:
             strategies = mgr.get_all_strategies() or []
         except Exception:
@@ -785,14 +794,17 @@ with tab_terminal:
 
     @st.fragment(run_every=timedelta(seconds=10))
     def _event_feed():
-        try:
-            logs = list(mgr.logs)
-        except Exception:
-            logs = []
         st.markdown(
             '<p class="section-lbl" style="margin-top:4px">Trading Events</p>',
             unsafe_allow_html=True,
         )
+        if not st.session_state.connected:
+            st.caption("Connect to see trading events.")
+            return
+        try:
+            logs = list(mgr.logs)
+        except Exception:
+            logs = []
         with st.expander("Event Log", expanded=bool(logs)):
             if logs:
                 st.text_area("logs_main", value="\n".join(logs[-100:]), height=240,
@@ -1034,6 +1046,9 @@ with tab_guide:
 
     @st.fragment(run_every=timedelta(seconds=10))
     def _guide_live_status():
+        if not st.session_state.connected:
+            st.caption("Connect your CoinDCX API key to see live system status.")
+            return
         _fb = {
             "active_strategies": 0, "total_pnl": 0.0,
             "margin_used": 0.0, "margin_available": 0.0,
