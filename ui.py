@@ -188,56 +188,22 @@ if "preview_usdt_inr" not in st.session_state:
     st.session_state.preview_usdt_inr = None
 if "trading_mode" not in st.session_state:
     st.session_state.trading_mode = "Simulation"
-if "backend_authenticated" not in st.session_state:
-    st.session_state.backend_authenticated = not bool(_BACKEND_URL)
-
-# ── Backend-mode API-key gate ────────────────────────────────────────────
-if _BACKEND_URL and not st.session_state.backend_authenticated:
-    st.markdown(
-        '<p class="t-header">CoinDCX Strategy Terminal</p>'
-        '<p class="t-sub">Connect with your CoinDCX API key to continue.</p>',
-        unsafe_allow_html=True,
-    )
-    with st.form("api_key_login"):
-        _login_key = st.text_input("CoinDCX API Key", type="password")
-        _login_secret = st.text_input("CoinDCX API Secret", type="password")
-        _remember = st.checkbox("Remember API Secret (encrypted)")
-        _submitted = st.form_submit_button("Connect", type="primary")
-
-    if _submitted:
-        if not _login_key or not _login_secret:
-            st.error("Both API Key and API Secret are required.")
-        else:
-            _client = st.session_state.strategy_manager
-            result = _client.load_session(
-                api_key=_login_key,
-                secret=_login_secret,
-                remember_secret=_remember,
-            )
-            if result and result.get("user_id"):
-                _client.set_api_key(_login_key)
-                st.session_state.backend_authenticated = True
-                st.session_state["_backend_api_key"] = _login_key
-                st.session_state["_backend_api_secret"] = _login_secret
-                st.rerun()
-            else:
-                st.error("Could not connect to backend. Check your keys and try again.")
-    st.stop()
+if "live_trading_enabled" not in st.session_state:
+    st.session_state.live_trading_enabled = False
 
 mgr = st.session_state.strategy_manager
 
-# ── Backend health gate ──────────────────────────────────────────────────
+# ── Backend health check (non-blocking) ──────────────────────────────────
 if _BACKEND_URL:
     try:
         _backend_ok = mgr.health_check()
     except Exception:
         _backend_ok = False
     if not _backend_ok:
-        st.error(
-            "Backend server is not running. "
-            "Start it with: `uvicorn backend.main:app --reload`"
+        st.warning(
+            "Backend server is not reachable. "
+            "Live trading features may be unavailable."
         )
-        st.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -405,16 +371,71 @@ with st.sidebar:
         )
     st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
-    st.markdown('<p class="section-lbl">Connection</p>', unsafe_allow_html=True)
-    _default_key = st.session_state.get("_backend_api_key", os.getenv("COINDCX_API_KEY", ""))
-    _default_secret = st.session_state.get("_backend_api_secret", os.getenv("COINDCX_API_SECRET", ""))
-    api_key = st.text_input("API Key", type="password", value=_default_key)
-    api_secret = st.text_input("API Secret", type="password", value=_default_secret)
-    if trading_mode == "Simulation":
-        st.caption("Optional in Simulation mode")
-    else:
-        st.caption("Required for Live trading")
-    st.markdown('<hr class="hr">', unsafe_allow_html=True)
+    api_key = st.session_state.get(
+        "_backend_api_key", os.getenv("COINDCX_API_KEY", ""),
+    )
+    api_secret = st.session_state.get(
+        "_backend_api_secret", os.getenv("COINDCX_API_SECRET", ""),
+    )
+
+    if trading_mode == "Live":
+        _live_ok = st.session_state.live_trading_enabled
+        with st.expander(
+            "Live Trading Connection",
+            expanded=not _live_ok,
+        ):
+            if _live_ok:
+                st.success("Connected — live trading enabled.")
+            else:
+                st.caption(
+                    "Enter your CoinDCX API key to enable live trading."
+                )
+            _in_key = st.text_input(
+                "CoinDCX API Key", type="password",
+                value=api_key, key="live_key",
+            )
+            _in_secret = st.text_input(
+                "CoinDCX API Secret", type="password",
+                value=api_secret, key="live_secret",
+            )
+            _remember = False
+            if _BACKEND_URL:
+                _remember = st.checkbox(
+                    "Remember API Secret (encrypted)", key="live_remember",
+                )
+
+            if not _live_ok:
+                if st.button(
+                    "Connect", type="primary",
+                    use_container_width=True, key="live_connect",
+                ):
+                    if not _in_key or not _in_secret:
+                        st.error("Both API Key and API Secret are required.")
+                    else:
+                        _connect_ok = True
+                        if _BACKEND_URL:
+                            _result = mgr.load_session(
+                                api_key=_in_key,
+                                secret=_in_secret,
+                                remember_secret=_remember,
+                            )
+                            if _result and _result.get("user_id"):
+                                mgr.set_api_key(_in_key)
+                            else:
+                                st.error(
+                                    "Could not connect to backend. "
+                                    "Check your keys and try again."
+                                )
+                                _connect_ok = False
+                        if _connect_ok:
+                            st.session_state["_backend_api_key"] = _in_key
+                            st.session_state["_backend_api_secret"] = _in_secret
+                            st.session_state.live_trading_enabled = True
+                            st.rerun()
+
+            api_key = _in_key
+            api_secret = _in_secret
+        st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
     st.markdown('<p class="section-lbl">Instrument</p>', unsafe_allow_html=True)
     pair_label = st.selectbox("Pair", list(PAIR_OPTIONS.keys()))
@@ -621,8 +642,11 @@ with tab_terminal:
 
     # ── Button logic ─────────────────────────────────────────────────
     if start_clicked:
-        if trading_mode == "Live" and (not api_key or not api_secret):
-            st.error("API Key and Secret are required for Live trading.")
+        if trading_mode == "Live" and not st.session_state.live_trading_enabled:
+            st.error(
+                "Connect your CoinDCX API keys first. "
+                "Open **Live Trading Connection** in the sidebar."
+            )
         else:
             required_margin = notional_value / max(leverage, 1)
             allowed, msg = mgr.can_start_strategy(required_margin)
