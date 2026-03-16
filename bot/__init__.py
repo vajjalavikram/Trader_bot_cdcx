@@ -11,5 +11,6 @@ position_monitor    TP/SL monitoring loop for live positions.
 sim_wallet          Simulated wallet for paper-trading mode.
 strategy_config     Per-strategy configuration dataclass (enables parallel execution).
 strategy_manager    Multi-strategy registry, lifecycle, portfolio guardrails.
+persistence         Session-state persistence and recovery (data/session_state.json).
 main                Orchestration — entry scan → order → monitor.
 """

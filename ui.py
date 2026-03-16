@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from bot.strategy_manager import StrategyManager
+_BACKEND_URL = os.getenv("BACKEND_URL", "")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Page configuration (must be the first Streamlit call)
@@ -173,7 +173,13 @@ PAIR_OPTIONS = {
 # Session-state initialisation
 # ═══════════════════════════════════════════════════════════════════════════
 if "strategy_manager" not in st.session_state:
-    st.session_state.strategy_manager = StrategyManager()
+    if _BACKEND_URL:
+        from backend.client import BackendClient
+        st.session_state.strategy_manager = BackendClient(_BACKEND_URL)
+    else:
+        from bot.strategy_manager import StrategyManager
+        st.session_state.strategy_manager = StrategyManager()
+        st.session_state.strategy_manager.recover_session()
 if "instrument_rules" not in st.session_state:
     st.session_state.instrument_rules = None
 if "preview_price" not in st.session_state:
@@ -182,8 +188,56 @@ if "preview_usdt_inr" not in st.session_state:
     st.session_state.preview_usdt_inr = None
 if "trading_mode" not in st.session_state:
     st.session_state.trading_mode = "Simulation"
+if "backend_authenticated" not in st.session_state:
+    st.session_state.backend_authenticated = not bool(_BACKEND_URL)
 
-mgr: StrategyManager = st.session_state.strategy_manager
+# ── Backend-mode API-key gate ────────────────────────────────────────────
+if _BACKEND_URL and not st.session_state.backend_authenticated:
+    st.markdown(
+        '<p class="t-header">CoinDCX Strategy Terminal</p>'
+        '<p class="t-sub">Connect with your CoinDCX API key to continue.</p>',
+        unsafe_allow_html=True,
+    )
+    with st.form("api_key_login"):
+        _login_key = st.text_input("CoinDCX API Key", type="password")
+        _login_secret = st.text_input("CoinDCX API Secret", type="password")
+        _remember = st.checkbox("Remember API Secret (encrypted)")
+        _submitted = st.form_submit_button("Connect", type="primary")
+
+    if _submitted:
+        if not _login_key or not _login_secret:
+            st.error("Both API Key and API Secret are required.")
+        else:
+            _client = st.session_state.strategy_manager
+            result = _client.load_session(
+                api_key=_login_key,
+                secret=_login_secret,
+                remember_secret=_remember,
+            )
+            if result and result.get("user_id"):
+                _client.set_api_key(_login_key)
+                st.session_state.backend_authenticated = True
+                st.session_state["_backend_api_key"] = _login_key
+                st.session_state["_backend_api_secret"] = _login_secret
+                st.rerun()
+            else:
+                st.error("Could not connect to backend. Check your keys and try again.")
+    st.stop()
+
+mgr = st.session_state.strategy_manager
+
+# ── Backend health gate ──────────────────────────────────────────────────
+if _BACKEND_URL:
+    try:
+        _backend_ok = mgr.health_check()
+    except Exception:
+        _backend_ok = False
+    if not _backend_ok:
+        st.error(
+            "Backend server is not running. "
+            "Start it with: `uvicorn backend.main:app --reload`"
+        )
+        st.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -352,8 +406,10 @@ with st.sidebar:
     st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
     st.markdown('<p class="section-lbl">Connection</p>', unsafe_allow_html=True)
-    api_key = st.text_input("API Key", type="password", value=os.getenv("COINDCX_API_KEY", ""))
-    api_secret = st.text_input("API Secret", type="password", value=os.getenv("COINDCX_API_SECRET", ""))
+    _default_key = st.session_state.get("_backend_api_key", os.getenv("COINDCX_API_KEY", ""))
+    _default_secret = st.session_state.get("_backend_api_secret", os.getenv("COINDCX_API_SECRET", ""))
+    api_key = st.text_input("API Key", type="password", value=_default_key)
+    api_secret = st.text_input("API Secret", type="password", value=_default_secret)
     if trading_mode == "Simulation":
         st.caption("Optional in Simulation mode")
     else:
@@ -376,9 +432,17 @@ with st.sidebar:
 
     st.markdown('<p class="section-lbl">System Logs</p>', unsafe_allow_html=True)
     with st.expander("Logs", expanded=False):
-        logs = list(mgr.logs)
-        if logs:
-            st.text_area("log_output", value="\n".join(logs[-150:]), height=300,
+        try:
+            _sidebar_logs = list(mgr.logs)
+        except Exception:
+            _sidebar_logs = []
+        if "logs_cache" not in st.session_state:
+            st.session_state.logs_cache = []
+        if _sidebar_logs:
+            st.session_state.logs_cache = _sidebar_logs
+        _display_logs = st.session_state.logs_cache
+        if _display_logs:
+            st.text_area("log_output", value="\n".join(_display_logs[-150:]), height=300,
                          disabled=True, label_visibility="collapsed")
         else:
             st.caption("No events yet.")
@@ -392,15 +456,25 @@ preview_price = st.session_state.preview_price
 preview_usdt_inr = st.session_state.preview_usdt_inr
 
 # ── System status bar (auto-refreshing) ──────────────────────────────────
-@st.fragment(run_every=timedelta(seconds=5))
+@st.fragment(run_every=timedelta(seconds=10))
 def _system_status_bar():
-    summary = mgr.get_portfolio_summary()
+    _fallback_summary = {
+        "active_strategies": 0, "total_pnl": 0.0,
+        "margin_used": 0.0, "margin_available": 0.0,
+    }
+    try:
+        summary = mgr.get_portfolio_summary() or _fallback_summary
+    except Exception:
+        summary = _fallback_summary
+    try:
+        all_strats = mgr.get_all_strategies() or []
+    except Exception:
+        all_strats = []
+
     csym = "₹" if margin_currency == "INR" else "$"
     mode = st.session_state.trading_mode
-    active = summary["active_strategies"]
-    has_error = any(
-        s.get("status") == "error" for s in mgr.get_all_strategies()
-    )
+    active = summary.get("active_strategies", 0)
+    has_error = any(s.get("status") == "error" for s in all_strats)
 
     if has_error:
         dot_color, sys_label = "#F59E0B", "Warning"
@@ -409,7 +483,7 @@ def _system_status_bar():
     else:
         dot_color, sys_label = "#6B7280", "Idle"
 
-    pnl = summary["total_pnl"]
+    pnl = summary.get("total_pnl", 0)
     pnl_color = "#10B981" if pnl > 0 else "#EF4444" if pnl < 0 else "#9CA3AF"
 
     bar_html = (
@@ -425,7 +499,7 @@ def _system_status_bar():
         f'<span class="status-val">{active}</span></span>'
         '<span class="status-divider">|</span>'
         f'<span class="status-item">Margin Used: '
-        f'<span class="status-val">{csym}{summary["margin_used"]:,.0f}</span></span>'
+        f'<span class="status-val">{csym}{summary.get("margin_used", 0):,.0f}</span></span>'
         '<span class="status-divider">|</span>'
         f'<span class="status-item">Portfolio PnL: '
         f'<span style="color:{pnl_color};font-weight:700">'
@@ -518,7 +592,10 @@ with tab_terminal:
 
         start_clicked = st.button("Start Strategy", use_container_width=True, type="primary")
 
-        active_ids = mgr.get_active_strategy_ids()
+        try:
+            active_ids = mgr.get_active_strategy_ids() or []
+        except Exception:
+            active_ids = []
         if active_ids:
             stop_id = st.selectbox("Stop Strategy", active_ids, key="stop_select")
             stop_clicked = st.button("Stop Selected", use_container_width=True)
@@ -526,7 +603,10 @@ with tab_terminal:
             stop_id = None
             stop_clicked = False
 
-        all_strats = mgr.get_all_strategies()
+        try:
+            all_strats = mgr.get_all_strategies() or []
+        except Exception:
+            all_strats = []
         finished_ids = [
             s["id"] for s in all_strats
             if s["status"] in ("stopped", "expired", "closed", "error", "waiting")
@@ -581,10 +661,20 @@ with tab_terminal:
         st.rerun()
 
     # ── Center dashboard — auto-refreshing strategy table ────────────
-    @st.fragment(run_every=timedelta(seconds=5))
+    @st.fragment(run_every=timedelta(seconds=10))
     def _strategy_dashboard():
-        strategies = mgr.get_all_strategies()
-        summary = mgr.get_portfolio_summary()
+        _fb_summary = {
+            "active_strategies": 0, "total_pnl": 0.0,
+            "margin_used": 0.0, "margin_available": 0.0,
+        }
+        try:
+            strategies = mgr.get_all_strategies() or []
+        except Exception:
+            strategies = []
+        try:
+            summary = mgr.get_portfolio_summary() or _fb_summary
+        except Exception:
+            summary = _fb_summary
         mc = margin_currency
         csym = "₹" if mc == "INR" else "$"
         now = time.time()
@@ -661,7 +751,7 @@ with tab_terminal:
 
         styled = df.style.map(_color_pnl, subset=["PnL"])
 
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
     with col_main:
         _strategy_dashboard()
@@ -669,9 +759,12 @@ with tab_terminal:
     # ── Bottom — full-width event feed ───────────────────────────────
     st.markdown('<hr class="hr">', unsafe_allow_html=True)
 
-    @st.fragment(run_every=timedelta(seconds=5))
+    @st.fragment(run_every=timedelta(seconds=10))
     def _event_feed():
-        logs = list(mgr.logs)
+        try:
+            logs = list(mgr.logs)
+        except Exception:
+            logs = []
         st.markdown(
             '<p class="section-lbl" style="margin-top:4px">Trading Events</p>',
             unsafe_allow_html=True,
@@ -690,7 +783,7 @@ with tab_terminal:
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_market:
 
-    @st.fragment(run_every=timedelta(seconds=5))
+    @st.fragment(run_every=timedelta(seconds=10))
     def _market_viewer():
         # ── Controls row ─────────────────────────────────────────────
         c1, c2, c3 = st.columns(3)
@@ -784,7 +877,7 @@ with tab_market:
                     margin=dict(l=0, r=0, t=30, b=0),
                     height=420,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key="mv_chart")
             else:
                 st.caption("No chart data available for this instrument.")
         except Exception:
@@ -808,7 +901,7 @@ with tab_market:
                 if bid_rows:
                     st.dataframe(
                         pd.DataFrame(bid_rows),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
                 else:
                     st.caption("No bids available.")
@@ -821,7 +914,7 @@ with tab_market:
                 if ask_rows:
                     st.dataframe(
                         pd.DataFrame(ask_rows),
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
                 else:
                     st.caption("No asks available.")
@@ -857,7 +950,7 @@ with tab_market:
                     })
                 st.dataframe(
                     pd.DataFrame(trade_rows),
-                    use_container_width=True, hide_index=True,
+                    width="stretch", hide_index=True,
                 )
             else:
                 st.caption("No recent trades available.")
@@ -915,9 +1008,16 @@ with tab_guide:
     # ── Live System Status ───────────────────────────────────────────
     st.subheader("Live System Status")
 
-    @st.fragment(run_every=timedelta(seconds=5))
+    @st.fragment(run_every=timedelta(seconds=10))
     def _guide_live_status():
-        summary = mgr.get_portfolio_summary()
+        _fb = {
+            "active_strategies": 0, "total_pnl": 0.0,
+            "margin_used": 0.0, "margin_available": 0.0,
+        }
+        try:
+            summary = mgr.get_portfolio_summary() or _fb
+        except Exception:
+            summary = _fb
         csym = "₹" if margin_currency == "INR" else "$"
         g1, g2, g3, g4 = st.columns(4)
         with g1:

@@ -39,45 +39,48 @@ This project solves all four.  You set your rules once, click Start, and the bot
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Streamlit Dashboard                   │
-│          (ui.py — configuration & monitoring)            │
-└───────────────────────┬─────────────────────────────────┘
-                        │
-          ┌─────────────▼──────────────┐
-          │      Strategy Engine       │
-          │  (strategy.py — evaluate   │
-          │   momentum / reversal)     │
-          └─────────────┬──────────────┘
-                        │
-          ┌─────────────▼──────────────┐
-          │     Execution Engine       │
-          │  (execution.py — orders,   │
-          │   leverage, TP/SL, wallet) │
-          └─────────────┬──────────────┘
-                        │
-          ┌─────────────▼──────────────┐
-          │   Exchange Rule Layer      │
-          │  (exchange_precision.py —  │
-          │   snap prices & quantities │
-          │   to valid tick sizes)     │
-          └─────────────┬──────────────┘
-                        │
-          ┌─────────────▼──────────────┐
-          │     CoinDCX REST API       │
-          └────────────────────────────┘
+                    ┌──────────────────┐
+                    │  Streamlit UI    │◄── standalone (default)
+                    │  (ui.py)         │     or HTTP client
+                    └────────┬─────────┘
+                             │  (direct import OR HTTP)
+                    ┌────────▼─────────┐
+                    │  FastAPI Backend  │◄── optional, owns StrategyManager
+                    │  (backend/)      │     when BACKEND_URL is set
+                    └────────┬─────────┘
+                             │
+          ┌──────────────────▼───────────────────┐
+          │          StrategyManager              │
+          │  (strategy threads, persistence,      │
+          │   heartbeat monitor, portfolio guard) │
+          └──────────────────┬───────────────────┘
+                             │
+          ┌──────────────────▼───────────────────┐
+          │      Strategy Engine (strategy.py)    │
+          │  momentum / reversal entry evaluation │
+          └──────────────────┬───────────────────┘
+                             │
+          ┌──────────────────▼───────────────────┐
+          │   Execution Engine (execution.py)     │
+          │   orders, leverage, TP/SL, wallet     │
+          └──────────────────┬───────────────────┘
+                             │
+          ┌──────────────────▼───────────────────┐
+          │   Precision Layer (exchange_precision)│
+          │   snap prices & quantities            │
+          └──────────────────┬───────────────────┘
+                             │
+          ┌──────────────────▼───────────────────┐
+          │          CoinDCX REST API             │
+          └──────────────────────────────────────┘
 
-          ┌────────────────────────────┐
-          │    Monitoring Engine       │
-          │  (position_monitor.py —    │
-          │   track TP/SL, exit)       │
-          └────────────────────────────┘
+          ┌──────────────────────────────────────┐
+          │  Position Monitor (position_monitor)  │
+          └──────────────────────────────────────┘
 
-          ┌────────────────────────────┐
-          │    Simulation Engine       │
-          │  (sim_wallet.py — fake     │
-          │   wallet & PnL tracking)   │
-          └────────────────────────────┘
+          ┌──────────────────────────────────────┐
+          │  Simulation Engine (sim_wallet)       │
+          └──────────────────────────────────────┘
 ```
 
 ---
@@ -93,6 +96,14 @@ Trading Bot/
 ├── .env.example              Template for environment variables
 ├── .gitignore                Excludes .env, runtime_config.json, __pycache__
 │
+├── backend/                  FastAPI backend (optional — decoupled engine)
+│   ├── __init__.py
+│   ├── main.py               App entrypoint, creates StrategyManager singleton
+│   ├── client.py             HTTP client matching StrategyManager interface
+│   └── api/
+│       ├── __init__.py
+│       └── strategy_routes.py  REST endpoints for strategy lifecycle & queries
+│
 └── bot/
     ├── __init__.py           Package docstring and module index
     ├── config.py             All strategy parameters, API keys, runtime loading
@@ -102,6 +113,9 @@ Trading Bot/
     ├── exchange_precision.py Price and quantity snapping to exchange tick sizes
     ├── position_monitor.py   Live TP/SL monitoring loop, shared hit-detection helper
     ├── sim_wallet.py         Thread-safe simulated wallet for paper trading
+    ├── persistence.py        Session-state persistence and recovery
+    ├── strategy_config.py    Per-strategy configuration dataclass
+    ├── strategy_manager.py   Multi-strategy registry, lifecycle, portfolio guardrails
     └── main.py               Orchestration: validate → scan → order → monitor → done
 ```
 
@@ -208,6 +222,37 @@ python share_dashboard.py
 Uses [ngrok](https://ngrok.com/) to expose the Streamlit dashboard with a public URL you can share on Slack.
 
 > Requires a free ngrok auth token: `ngrok config add-authtoken <TOKEN>` or set `NGROK_AUTHTOKEN`.
+
+### Backend API (optional)
+
+The project supports a decoupled architecture where a FastAPI backend owns the `StrategyManager` and the Streamlit UI communicates via HTTP.  This is optional — the default standalone mode still works exactly as before.
+
+**Terminal 1 — start the backend:**
+
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 — start the UI pointing at the backend:**
+
+```bash
+BACKEND_URL=http://localhost:8000 streamlit run ui.py
+```
+
+When `BACKEND_URL` is **not** set (Railway, Streamlit Cloud, or plain `streamlit run ui.py`), the UI falls back to running the `StrategyManager` locally — no backend required.
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/strategy/start` | POST | Register + start a strategy |
+| `/strategy/stop` | POST | Stop a running strategy |
+| `/strategy/{id}` | DELETE | Remove a finished strategy |
+| `/strategy/margin-check` | POST | Check margin availability |
+| `/strategies` | GET | List all strategies |
+| `/strategies/active/ids` | GET | Active strategy IDs |
+| `/portfolio` | GET | Portfolio summary |
+| `/logs` | GET | Recent log entries |
+| `/settings` | GET | Current settings |
+| `/settings/max-margin` | PUT | Update max portfolio margin |
 
 ---
 
