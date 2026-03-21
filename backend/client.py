@@ -82,7 +82,11 @@ class BackendClient:
         secret: str,
         remember_secret: bool = False,
     ) -> Dict[str, Any]:
-        """Call ``POST /api/session/load`` and return the response dict."""
+        """Call ``POST /api/session/load`` and return the response dict.
+
+        On failure, returns ``{"error": "<description>"}`` so the UI can
+        display a specific message instead of a generic one.
+        """
         try:
             resp = _req.post(
                 f"{self._url}/api/session/load",
@@ -93,11 +97,26 @@ class BackendClient:
                 },
                 timeout=_TIMEOUT,
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                detail = resp.text
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    pass
+                logger.error(
+                    "load_session HTTP %d: %s", resp.status_code, detail,
+                )
+                return {"error": f"Backend returned HTTP {resp.status_code}: {detail}"}
             return resp.json()
+        except _req.exceptions.ConnectionError:
+            logger.error("load_session: backend not reachable at %s", self._url)
+            return {"error": "Backend not reachable. Is the server running?"}
+        except _req.exceptions.Timeout:
+            logger.error("load_session: request timed out after %ds", _TIMEOUT)
+            return {"error": f"Request timed out after {_TIMEOUT}s."}
         except _req.exceptions.RequestException as exc:
             logger.error("load_session failed: %s", exc)
-            return {}
+            return {"error": str(exc)}
 
     # ------------------------------------------------------------------
     # Logs  (accessed as ``mgr.logs`` — must behave like a deque)

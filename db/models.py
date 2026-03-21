@@ -4,6 +4,7 @@
 """
 
 import logging
+import time
 
 from db.database import get_connection
 
@@ -150,7 +151,7 @@ def initialize_database() -> None:
 
         # ── Seed default user ────────────────────────────────────────
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, created_at) "
-            "VALUES (?, strftime('%s', 'now'))",
-            (_DEFAULT_USER,),
+            "INSERT INTO users (user_id, created_at) "
+            "VALUES (?, ?) ON CONFLICT DO NOTHING",
+            (_DEFAULT_USER, int(time.time())),
         )

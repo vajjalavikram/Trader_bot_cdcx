@@ -418,10 +418,14 @@ with st.sidebar:
                         st.session_state.live_trading_enabled = True
                         st.rerun()
                     else:
-                        st.error(
-                            "Could not connect to backend. "
-                            "Check your keys and try again."
-                        )
+                        err_detail = (_result or {}).get("error", "")
+                        if err_detail:
+                            st.error(f"Connection failed: {err_detail}")
+                        else:
+                            st.error(
+                                "Could not connect to backend. "
+                                "Check your keys and try again."
+                            )
 
         api_key = _in_key
         api_secret = _in_secret

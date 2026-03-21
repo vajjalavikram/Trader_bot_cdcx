@@ -150,7 +150,7 @@ def _sanitize(strategies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 _UPSERT_SQL = """
-    INSERT OR REPLACE INTO strategies (
+    INSERT INTO strategies (
         strategy_id, user_id,
         pair, pair_label, direction, strategy_mode, trading_mode,
         notional, leverage, margin,
@@ -171,6 +171,35 @@ _UPSERT_SQL = """
         ?, ?, ?,
         ?, ?
     )
+    ON CONFLICT (strategy_id) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        pair = EXCLUDED.pair,
+        pair_label = EXCLUDED.pair_label,
+        direction = EXCLUDED.direction,
+        strategy_mode = EXCLUDED.strategy_mode,
+        trading_mode = EXCLUDED.trading_mode,
+        notional = EXCLUDED.notional,
+        leverage = EXCLUDED.leverage,
+        margin = EXCLUDED.margin,
+        dip_percent = EXCLUDED.dip_percent,
+        strategy_expiry_minutes = EXCLUDED.strategy_expiry_minutes,
+        tp_percent = EXCLUDED.tp_percent,
+        sl_percent = EXCLUDED.sl_percent,
+        status = EXCLUDED.status,
+        phase = EXCLUDED.phase,
+        entry_price = EXCLUDED.entry_price,
+        tp_price = EXCLUDED.tp_price,
+        sl_price = EXCLUDED.sl_price,
+        quantity = EXCLUDED.quantity,
+        current_price = EXCLUDED.current_price,
+        pnl = EXCLUDED.pnl,
+        pnl_percent = EXCLUDED.pnl_percent,
+        wallet_balance = EXCLUDED.wallet_balance,
+        error = EXCLUDED.error,
+        error_detail_json = EXCLUDED.error_detail_json,
+        params_json = EXCLUDED.params_json,
+        created_at = EXCLUDED.created_at,
+        last_heartbeat = EXCLUDED.last_heartbeat
 """
 
 

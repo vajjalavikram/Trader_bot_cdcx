@@ -126,7 +126,8 @@ def _ensure_user(user_id: str) -> None:
     conn = get_connection()
     with conn:
         conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)",
+            "INSERT INTO users (user_id, created_at) VALUES (?, ?) "
+            "ON CONFLICT DO NOTHING",
             (user_id, int(time.time())),
         )
 
@@ -145,35 +146,88 @@ def create_router(manager: StrategyManager) -> APIRouter:
     @router.post("/session/load", response_model=SessionLoadResponse)
     def load_session(req: SessionLoadRequest):
         """Identify user from API key, optionally store secret, return strategies."""
-        user_id = get_user_id_from_api_key(req.api_key)
-        _ensure_user(user_id)
+        logger.info(
+            "POST /session/load — api_key=%s… remember=%s",
+            req.api_key[:8] if req.api_key else "(empty)",
+            req.remember_secret,
+        )
+
+        if not req.api_key:
+            logger.warning("session/load called with empty api_key")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="api_key is required",
+            )
+
+        try:
+            user_id = get_user_id_from_api_key(req.api_key)
+            logger.info("Derived user_id=%s…", user_id[:12])
+        except Exception as exc:
+            logger.error("Failed to derive user_id: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Identity derivation failed: {exc}",
+            )
+
+        try:
+            _ensure_user(user_id)
+            logger.info("User row ensured for %s…", user_id[:12])
+        except Exception as exc:
+            logger.error("_ensure_user failed: %s", exc, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database error creating user: {exc}",
+            )
 
         if req.remember_secret:
-            encrypted = encrypt_secret(req.secret)
-            conn = get_connection()
-            existing = conn.execute(
-                "SELECT key_id FROM api_keys WHERE user_id = ? AND api_key = ?",
-                (user_id, req.api_key),
-            ).fetchone()
-            with conn:
-                if existing:
-                    conn.execute(
-                        "UPDATE api_keys SET encrypted_secret = ? WHERE key_id = ?",
-                        (encrypted, dict(existing)["key_id"]),
-                    )
-                else:
-                    conn.execute(
-                        "INSERT INTO api_keys "
-                        "(key_id, user_id, exchange, api_key, encrypted_secret, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (uuid.uuid4().hex, user_id, "coindcx", req.api_key, encrypted, int(time.time())),
-                    )
+            try:
+                encrypted = encrypt_secret(req.secret)
+            except RuntimeError as exc:
+                logger.error("Encryption failed (ENCRYPTION_KEY missing?): %s", exc)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=str(exc),
+                )
+
+            try:
+                conn = get_connection()
+                existing = conn.execute(
+                    "SELECT key_id FROM api_keys WHERE user_id = ? AND api_key = ?",
+                    (user_id, req.api_key),
+                ).fetchone()
+                with conn:
+                    if existing:
+                        conn.execute(
+                            "UPDATE api_keys SET encrypted_secret = ? WHERE key_id = ?",
+                            (encrypted, dict(existing)["key_id"]),
+                        )
+                        logger.info("Updated encrypted secret for existing key")
+                    else:
+                        conn.execute(
+                            "INSERT INTO api_keys "
+                            "(key_id, user_id, exchange, api_key, encrypted_secret, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (uuid.uuid4().hex, user_id, "coindcx", req.api_key, encrypted, int(time.time())),
+                        )
+                        logger.info("Stored new encrypted API key")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.error("Failed to store API key: %s", exc, exc_info=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Database error storing key: {exc}",
+                )
 
         owned = _user_strategy_ids(user_id)
         strategies = [
             s for s in manager.get_all_strategies()
             if s.get("id") in owned
         ]
+        logger.info(
+            "session/load success — user=%s… strategies=%d",
+            user_id[:12], len(strategies),
+        )
         return SessionLoadResponse(user_id=user_id, strategies=strategies)
 
     # ── Strategy lifecycle ───────────────────────────────────────────

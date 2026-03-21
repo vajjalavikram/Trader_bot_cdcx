@@ -14,18 +14,17 @@ import os
 
 from cryptography.fernet import Fernet, InvalidToken
 
-_KEY = os.getenv("ENCRYPTION_KEY", "")
-
 
 def _get_fernet() -> Fernet:
-    if not _KEY:
+    key = os.getenv("ENCRYPTION_KEY", "")
+    if not key:
         raise RuntimeError(
             "ENCRYPTION_KEY environment variable is not set. "
             "Generate one with: "
             'python -c "from cryptography.fernet import Fernet; '
             'print(Fernet.generate_key().decode())"'
         )
-    return Fernet(_KEY.encode("utf-8"))
+    return Fernet(key.encode("utf-8"))
 
 
 def encrypt_secret(secret: str) -> str:
